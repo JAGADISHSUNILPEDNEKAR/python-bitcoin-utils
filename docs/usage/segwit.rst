@@ -1,7 +1,7 @@
 SegWit Functionality
 ==================
 
-SegWit (Segregated Witness) is a Bitcoin protocol upgrade that separates transaction signatures from transaction data, resulting in several benefits such as increased transaction capacity and fixing transaction malleability.
+SegWit (Segregated Witness) is a Bitcoin protocol upgrade that separates witness data (signatures and scripts) from the rest of the transaction, resulting in several benefits such as increased transaction capacity and fixing transaction malleability.
 
 The Python Bitcoin Utils library provides comprehensive support for SegWit, including both version 0 (P2WPKH, P2WSH) and version 1 (Taproot/P2TR).
 
@@ -43,11 +43,11 @@ P2WSH (Pay to Witness Script Hash)
     from bitcoinutils.script import Script
 
     setup('testnet')
-    pub1 = PublicKey("public_key_1_hex")
-    pub2 = PublicKey("public_key_2_hex")
+    pub1 = PublicKey("03a1af804ac108a8a51782198c2d034b28bf90c8803f5a53f76276fa69a4eae77f")
+    pub2 = PublicKey("02530c548d402670b13ad8887ff99c294e67fc18097d236d57880c69261b42def7")
 
     # Create a 2-of-2 multisig redeem script
-    redeem_script = Script([2, pub1.to_hex(), pub2.to_hex(), 2, 'OP_CHECKMULTISIG'])
+    redeem_script = Script(['OP_2', pub1.to_hex(), pub2.to_hex(), 'OP_2', 'OP_CHECKMULTISIG'])
     witness_script_addr = redeem_script.get_segwit_address()
     print(f"P2WSH address: {witness_script_addr.to_string()}")
 
@@ -78,11 +78,11 @@ P2SH-P2WSH
     from bitcoinutils.script import Script
 
     setup('testnet')
-    pub1 = PublicKey("public_key_1_hex")
-    pub2 = PublicKey("public_key_2_hex")
+    pub1 = PublicKey("03a1af804ac108a8a51782198c2d034b28bf90c8803f5a53f76276fa69a4eae77f")
+    pub2 = PublicKey("02530c548d402670b13ad8887ff99c294e67fc18097d236d57880c69261b42def7")
 
     # Create a 2-of-2 multisig redeem script
-    redeem_script = Script([2, pub1.to_hex(), pub2.to_hex(), 2, 'OP_CHECKMULTISIG'])
+    redeem_script = Script(['OP_2', pub1.to_hex(), pub2.to_hex(), 'OP_2', 'OP_CHECKMULTISIG'])
     p2sh_p2wsh_addr = redeem_script.get_p2sh_p2wsh_address()
     print(f"P2SH-P2WSH address: {p2sh_p2wsh_addr.to_string()}")
 
@@ -109,27 +109,37 @@ Sending to a P2WPKH Address
 .. code-block:: python
 
     from bitcoinutils.setup import setup
-    from bitcoinutils.keys import PrivateKey, P2wpkhAddress
+    from bitcoinutils.keys import PrivateKey, P2wpkhAddress, P2pkhAddress
     from bitcoinutils.transactions import Transaction, TxInput, TxOutput
+    from bitcoinutils.script import Script
+    from bitcoinutils.utils import to_satoshis
 
     setup('testnet')
 
     # Create a P2WPKH address to send to
     recipient_addr = P2wpkhAddress('tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx')
 
-    # Create transaction input (from a previous transaction)
-    txin = TxInput('previous_tx_id', 0)
+    # Create transaction input (from a previous P2PKH transaction)
+    txin = TxInput('a16f3ce4dd5deb92d98ef5cf8afeaf0775ebca408f708b2146c4fb42b41e14be', 0)
 
     # Create transaction output
-    txout = TxOutput(0.001, recipient_addr.to_script_pub_key())
+    txout = TxOutput(to_satoshis(0.001), recipient_addr.to_script_pub_key())
 
-    # Create transaction
+    # Create transaction (not segwit since we're spending from P2PKH)
     tx = Transaction([txin], [txout])
 
     # Sign the transaction
-    priv_key = PrivateKey('private_key_wif')
-    sig = priv_key.sign_input(tx, 0, prev_script_pub_key)
-    txin.script_sig = sig
+    priv_key = PrivateKey('cTALNpTpRbbxTCJ2A5Zq6NwAnBSQjguuuhdyzLbWXDuA8ExBq58d')
+    from_addr = P2pkhAddress('n4bkvTyU1dVdzsrhWBqBw8fEMbHjJvtmJR')
+    
+    sig = priv_key.sign_input(
+        tx, 0, 
+        from_addr.to_script_pub_key()
+    )
+    
+    # Set the scriptSig
+    pub_key = priv_key.get_public_key()
+    txin.script_sig = Script([sig, pub_key.to_hex()])
 
     print(f"Signed transaction: {tx.serialize()}")
 
@@ -140,33 +150,88 @@ Spending from a P2WPKH Address
 
     from bitcoinutils.setup import setup
     from bitcoinutils.keys import PrivateKey, P2pkhAddress
-    from bitcoinutils.transactions import Transaction, TxInput, TxOutput
+    from bitcoinutils.transactions import Transaction, TxInput, TxOutput, TxWitnessInput
     from bitcoinutils.script import Script
+    from bitcoinutils.utils import to_satoshis
 
     setup('testnet')
 
     # Create a transaction input (from a P2WPKH UTXO)
-    txin = TxInput('previous_tx_id', 0)
+    txin = TxInput('a16f3ce4dd5deb92d98ef5cf8afeaf0775ebca408f708b2146c4fb42b41e14be', 0)
 
     # Create a P2PKH address to send to
-    recipient_addr = P2pkhAddress('recipient_address')
+    recipient_addr = P2pkhAddress('n4bkvTyU1dVdzsrhWBqBw8fEMbHjJvtmJR')
 
     # Create transaction output
-    txout = TxOutput(0.0009, recipient_addr.to_script_pub_key())
+    txout = TxOutput(to_satoshis(0.0009), recipient_addr.to_script_pub_key())
 
-    # Create transaction
-    tx = Transaction([txin], [txout])
+    # Create transaction with has_segwit=True
+    tx = Transaction([txin], [txout], has_segwit=True)
 
-    # For SegWit inputs, use sign_segwit_input instead of sign_input
-    priv_key = PrivateKey('private_key_wif')
+    # Prepare for signing
+    priv_key = PrivateKey('cTALNpTpRbbxTCJ2A5Zq6NwAnBSQjguuuhdyzLbWXDuA8ExBq58d')
     pub_key = priv_key.get_public_key()
-    script_code = Script(['OP_DUP', 'OP_HASH160', pub_key.to_hash160(), 'OP_EQUALVERIFY', 'OP_CHECKSIG'])
+    
+    # For P2WPKH, the script code is the same as P2PKH scriptPubKey
+    script_code = Script([
+        'OP_DUP', 'OP_HASH160', 
+        pub_key.to_hash160(), 
+        'OP_EQUALVERIFY', 'OP_CHECKSIG'
+    ])
 
     # Sign the segwit input
-    signature = priv_key.sign_segwit_input(tx, 0, script_code, 0.001)
+    amount = to_satoshis(0.001)  # Amount being spent from the UTXO
+    signature = priv_key.sign_segwit_input(tx, 0, script_code, amount)
 
     # Set witness data for the input
-    txin.witness = [signature, pub_key.to_hex()]
+    tx.witnesses.append(TxWitnessInput([signature, pub_key.to_hex()]))
+
+    print(f"Signed transaction: {tx.serialize()}")
+
+P2WSH Transaction Example
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: python
+
+    from bitcoinutils.setup import setup
+    from bitcoinutils.keys import PrivateKey, P2pkhAddress
+    from bitcoinutils.transactions import Transaction, TxInput, TxOutput, TxWitnessInput
+    from bitcoinutils.script import Script
+    from bitcoinutils.utils import to_satoshis
+
+    setup('testnet')
+
+    # Create a 2-of-2 multisig witness script
+    priv1 = PrivateKey('cTALNpTpRbbxTCJ2A5Zq6NwAnBSQjguuuhdyzLbWXDuA8ExBq58d')
+    priv2 = PrivateKey('cRvyLwCPLU88jsyj94L7iJjQX5C2f8koG4G2gevN4BeSGcEvfKe9')
+    pub1 = priv1.get_public_key()
+    pub2 = priv2.get_public_key()
+    
+    witness_script = Script([
+        'OP_2', pub1.to_hex(), pub2.to_hex(), 'OP_2', 'OP_CHECKMULTISIG'
+    ])
+
+    # Define recipient address
+    recipient_addr = P2pkhAddress('n4bkvTyU1dVdzsrhWBqBw8fEMbHjJvtmJR')
+
+    # Spending from P2WSH
+    txin = TxInput('a16f3ce4dd5deb92d98ef5cf8afeaf0775ebca408f708b2146c4fb42b41e14be', 0)
+    txout = TxOutput(to_satoshis(0.0009), recipient_addr.to_script_pub_key())
+    
+    tx = Transaction([txin], [txout], has_segwit=True)
+    
+    # Sign with both keys
+    amount = to_satoshis(0.001)
+    sig1 = priv1.sign_segwit_input(tx, 0, witness_script, amount)
+    sig2 = priv2.sign_segwit_input(tx, 0, witness_script, amount)
+    
+    # Witness for P2WSH multisig: empty item, sig1, sig2, witness_script
+    tx.witnesses.append(TxWitnessInput([
+        '',  # Empty item required for CHECKMULTISIG bug
+        sig1,
+        sig2,
+        witness_script.to_hex()
+    ]))
 
     print(f"Signed transaction: {tx.serialize()}")
 
@@ -180,29 +245,36 @@ Key Path Spending
 
     from bitcoinutils.setup import setup
     from bitcoinutils.keys import PrivateKey, P2trAddress
-    from bitcoinutils.transactions import Transaction, TxInput, TxOutput
+    from bitcoinutils.transactions import Transaction, TxInput, TxOutput, TxWitnessInput
+    from bitcoinutils.utils import to_satoshis
 
     setup('testnet')
 
     # Create transaction input from a P2TR UTXO
-    txin = TxInput('previous_tx_id', 0)
+    txin = TxInput('a16f3ce4dd5deb92d98ef5cf8afeaf0775ebca408f708b2146c4fb42b41e14be', 0)
 
     # Create a transaction output
-    recipient_addr = P2trAddress('recipient_taproot_address')
-    txout = TxOutput(0.0009, recipient_addr.to_script_pub_key())
+    recipient_addr = P2trAddress('tb1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr')
+    txout = TxOutput(to_satoshis(0.0009), recipient_addr.to_script_pub_key())
 
-    # Create transaction
-    tx = Transaction([txin], [txout])
+    # Create transaction with has_segwit=True
+    tx = Transaction([txin], [txout], has_segwit=True)
 
     # Sign the taproot input using key path
-    priv_key = PrivateKey('private_key_wif')
+    priv_key = PrivateKey('cTALNpTpRbbxTCJ2A5Zq6NwAnBSQjguuuhdyzLbWXDuA8ExBq58d')
+    
+    # Get the P2TR address and its scriptPubKey for this private key
+    taproot_addr = priv_key.get_public_key().get_taproot_address()
+    prev_script_pubkey = taproot_addr.to_script_pub_key()
+    
     signature = priv_key.sign_taproot_input(
         tx, 0, 
-        [{'value': 0.001, 'scriptPubKey': prev_script_pub_key}]
+        [prev_script_pubkey],  # List of all input script_pubkeys
+        [to_satoshis(0.001)]   # List of all input amounts
     )
 
-    # Set witness data for the input
-    txin.witness = [signature]
+    # Set witness data for key path spending (only signature)
+    tx.witnesses.append(TxWitnessInput([signature]))
 
     print(f"Signed transaction: {tx.serialize()}")
 
@@ -212,38 +284,52 @@ Script Path Spending
 .. code-block:: python
 
     from bitcoinutils.setup import setup
-    from bitcoinutils.keys import PrivateKey, PublicKey
-    from bitcoinutils.transactions import Transaction, TxInput, TxOutput
+    from bitcoinutils.keys import PrivateKey, PublicKey, P2pkhAddress
+    from bitcoinutils.transactions import Transaction, TxInput, TxOutput, TxWitnessInput
     from bitcoinutils.script import Script
+    from bitcoinutils.utils import to_satoshis
 
     setup('testnet')
 
     # Create transaction input from a P2TR UTXO
-    txin = TxInput('previous_tx_id', 0)
+    txin = TxInput('a16f3ce4dd5deb92d98ef5cf8afeaf0775ebca408f708b2146c4fb42b41e14be', 0)
 
     # Create a transaction output
-    recipient_addr = P2pkhAddress('recipient_address')
-    txout = TxOutput(0.0009, recipient_addr.to_script_pub_key())
+    recipient_addr = P2pkhAddress('n4bkvTyU1dVdzsrhWBqBw8fEMbHjJvtmJR')
+    txout = TxOutput(to_satoshis(0.0009), recipient_addr.to_script_pub_key())
 
-    # Create transaction
-    tx = Transaction([txin], [txout])
+    # Create transaction with has_segwit=True
+    tx = Transaction([txin], [txout], has_segwit=True)
 
     # For script path spending, you need the taproot script
-    tapscript = Script(['pub_key', 'OP_CHECKSIG'])
+    pub_key = PublicKey('03a1af804ac108a8a51782198c2d034b28bf90c8803f5a53f76276fa69a4eae77f')
+    tapscript = Script([pub_key.to_hex(), 'OP_CHECKSIG'])
     
     # Sign the taproot input using script path
-    priv_key = PrivateKey('private_key_wif')
+    priv_key = PrivateKey('cTALNpTpRbbxTCJ2A5Zq6NwAnBSQjguuuhdyzLbWXDuA8ExBq58d')
+    
+    # WARNING: This is a SIMPLIFIED EXAMPLE for illustration only!
+    # In production, the P2TR address must be properly constructed with:
+    # - An internal key (tweaked or untweaked)
+    # - A Merkle root derived from the script tree containing tapscript
+    # The address below is just a placeholder and won't work with the script above.
+    # See the library's taproot construction documentation for proper implementation.
+    
+    # For this example, we assume a P2TR address that was created with this script
+    taproot_addr = P2trAddress('tb1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr')
+    prev_script_pubkey = taproot_addr.to_script_pub_key()
+    
     signature = priv_key.sign_taproot_input(
         tx, 0, 
-        [{'value': 0.001, 'scriptPubKey': prev_script_pub_key}],
+        [prev_script_pubkey],
+        [to_satoshis(0.001)],
         script_path=True,
         tapleaf_script=tapscript
     )
 
-    # Control block computation and witness setup would be handled internally
-    # Set witness data for the input
-    # Note: This is a simplified example. Actual witness data would include the
-    # control block and the script.
+    # Note: Actual witness data would include the signature, the script, 
+    # and the control block. The control block computation would be 
+    # handled by other library functions.
     
     print(f"Signed transaction: {tx.serialize()}")
 
@@ -270,101 +356,122 @@ In SegWit transactions, the witness data is stored separately from the transacti
 P2WPKH Witness
 ^^^^^^^^^^^^^
 
-.. code-block:: 
+.. code-block:: python
 
     [signature, public_key]
 
 P2WSH Witness
 ^^^^^^^^^^^^
 
-.. code-block:: 
+For multisig:
 
-    [sig1, sig2, ..., sigN, redeem_script]
+.. code-block:: python
+
+    ['', sig1, sig2, ..., sigN, witness_script]
+
+Note: The empty string is required due to the CHECKMULTISIG off-by-one bug.
 
 P2TR Key Path Witness
 ^^^^^^^^^^^^^^^^^^^
 
-.. code-block:: 
+.. code-block:: python
 
     [signature]
 
 P2TR Script Path Witness
 ^^^^^^^^^^^^^^^^^^^^^^
 
-.. code-block:: 
+.. code-block:: python
 
-    [sig1, sig2, ..., script, control_block]
+    [signature, script, control_block]
 
 Automatic Handling of Witness Data
 --------------------------------
 
-The library automatically provides the correct witness format for different types of inputs:
+The library handles witness format for different input types when using higher-level transaction construction functions:
 
-* For non-witness inputs in SegWit transactions, the library adds a '00' byte as required by the protocol
-* For P2WPKH inputs, it creates a witness with signature and public key
-* For P2WSH inputs, it creates a witness with signatures and the witness script
-* For P2TR inputs, it creates a witness with one signature for key path spending, or signature, script and control block for script path spending
+* For non-witness inputs in SegWit transactions, empty witnesses are added
+* For P2WPKH inputs, create a witness with signature and public key
+* For P2WSH inputs, create a witness with signatures and the witness script
+* For P2TR inputs, create a witness with one signature for key path spending, or signature, script and control block for script path spending
 
 Mixed Input Transactions
 ----------------------
 
 When creating transactions with both SegWit and non-SegWit inputs:
 
-1. Each input needs its own specific signing method
-2. For non-SegWit inputs, use `sign_input`
-3. For SegWit v0 inputs, use `sign_segwit_input`
-4. For Taproot inputs, use `sign_taproot_input`
-5. Ensure witness data is correctly set for each input
-
 .. code-block:: python
 
-    # Example of a mixed input transaction
     from bitcoinutils.setup import setup
-    from bitcoinutils.keys import PrivateKey
-    from bitcoinutils.transactions import Transaction, TxInput, TxOutput
+    from bitcoinutils.keys import PrivateKey, P2pkhAddress, P2wpkhAddress
+    from bitcoinutils.transactions import Transaction, TxInput, TxOutput, TxWitnessInput
     from bitcoinutils.script import Script
+    from bitcoinutils.utils import to_satoshis
 
     setup('testnet')
 
     # Create transaction inputs
-    # Non-SegWit input
-    txin1 = TxInput('legacy_tx_id', 0)
-    # SegWit v0 input
-    txin2 = TxInput('segwit_v0_tx_id', 0)
-    # Taproot input
-    txin3 = TxInput('taproot_tx_id', 0)
+    # Non-SegWit input (P2PKH)
+    txin1 = TxInput('a16f3ce4dd5deb92d98ef5cf8afeaf0775ebca408f708b2146c4fb42b41e14be', 0)
+    # SegWit v0 input (P2WPKH)
+    txin2 = TxInput('75ddabb27b8845f5247975c8a5ba7c6f336c4570708ebe230caf6db5217ae858', 0)
+    # Taproot input (P2TR)
+    txin3 = TxInput('1dea7cd05979072a3578cab271c02244ea8a090bbb46aa680a65ecd027048d83', 0)
 
     # Create transaction output
-    recipient_addr = P2pkhAddress('recipient_address')
-    txout = TxOutput(0.0027, recipient_addr.to_script_pub_key())
+    recipient_addr = P2pkhAddress('n4bkvTyU1dVdzsrhWBqBw8fEMbHjJvtmJR')
+    txout = TxOutput(to_satoshis(0.0027), recipient_addr.to_script_pub_key())
 
-    # Create transaction
-    tx = Transaction([txin1, txin2, txin3], [txout])
+    # Create transaction with has_segwit=True (required for any segwit inputs)
+    tx = Transaction([txin1, txin2, txin3], [txout], has_segwit=True)
 
     # Sign each input with the appropriate method
-    # Legacy input
-    priv_key1 = PrivateKey('legacy_priv_key_wif')
-    sig1 = priv_key1.sign_input(tx, 0, legacy_script_pub_key)
-    txin1.script_sig = sig1
+    
+    # 1. Legacy P2PKH input
+    priv_key1 = PrivateKey('cTALNpTpRbbxTCJ2A5Zq6NwAnBSQjguuuhdyzLbWXDuA8ExBq58d')
+    pub_key1 = priv_key1.get_public_key()
+    legacy_addr = P2pkhAddress('n4bkvTyU1dVdzsrhWBqBw8fEMbHjJvtmJR')
+    
+    sig1 = priv_key1.sign_input(tx, 0, legacy_addr.to_script_pub_key())
+    txin1.script_sig = Script([sig1, pub_key1.to_hex()])
+    # Add empty witness for non-segwit input
+    tx.witnesses.append(TxWitnessInput([]))
 
-    # SegWit v0 input
-    priv_key2 = PrivateKey('segwit_v0_priv_key_wif')
+    # 2. SegWit v0 P2WPKH input
+    priv_key2 = PrivateKey('cRvyLwCPLU88jsyj94L7iJjQX5C2f8koG4G2gevN4BeSGcEvfKe9')
     pub_key2 = priv_key2.get_public_key()
-    script_code2 = Script(['OP_DUP', 'OP_HASH160', pub_key2.to_hash160(), 'OP_EQUALVERIFY', 'OP_CHECKSIG'])
-    sig2 = priv_key2.sign_segwit_input(tx, 1, script_code2, 0.001)
-    txin2.witness = [sig2, pub_key2.to_hex()]
+    script_code2 = Script([
+        'OP_DUP', 'OP_HASH160', 
+        pub_key2.to_hash160(), 
+        'OP_EQUALVERIFY', 'OP_CHECKSIG'
+    ])
+    
+    sig2 = priv_key2.sign_segwit_input(tx, 1, script_code2, to_satoshis(0.001))
+    tx.witnesses.append(TxWitnessInput([sig2, pub_key2.to_hex()]))
 
-    # Taproot input
-    priv_key3 = PrivateKey('taproot_priv_key_wif')
-    sig3 = priv_key3.sign_taproot_input(
-        tx, 2, 
-        [
-            {'value': 0.001, 'scriptPubKey': legacy_script_pub_key},
-            {'value': 0.001, 'scriptPubKey': segwit_v0_script_pub_key},
-            {'value': 0.001, 'scriptPubKey': taproot_script_pub_key}
-        ]
-    )
-    txin3.witness = [sig3]
+    # 3. Taproot P2TR input (key path)
+    priv_key3 = PrivateKey('cN9RbPMNcUwBzNNYa7cDJb2wPEKqCpCfe97KoHAWSdCDkqBTZ7tP')
+    
+    # Get proper scriptPubKeys for all inputs
+    segwit_addr = P2wpkhAddress.from_hash(pub_key2.to_hash160())
+    taproot_addr = priv_key3.get_public_key().get_taproot_address()
+    
+    # Collect all script_pubkeys and amounts for taproot signing
+    all_script_pubkeys = [
+        legacy_addr.to_script_pub_key(),
+        segwit_addr.to_script_pub_key(),  
+        taproot_addr.to_script_pub_key()
+    ]
+    all_amounts = [
+        to_satoshis(0.001),  # Amount for input 0
+        to_satoshis(0.001),  # Amount for input 1
+        to_satoshis(0.001)   # Amount for input 2
+    ]
+    
+    sig3 = priv_key3.sign_taproot_input(tx, 2, all_script_pubkeys, all_amounts)
+    tx.witnesses.append(TxWitnessInput([sig3]))
+
+    print(f"Signed mixed transaction: {tx.serialize()}")
 
 OP_CHECKSIGADD Support
 --------------------
@@ -374,19 +481,25 @@ Taproot introduces the new OP_CHECKSIGADD opcode for more efficient threshold mu
 .. code-block:: python
 
     from bitcoinutils.setup import setup
+    from bitcoinutils.keys import PublicKey
     from bitcoinutils.script import Script
 
     setup('testnet')
 
+    # Define public keys
+    pub1 = PublicKey('03a1af804ac108a8a51782198c2d034b28bf90c8803f5a53f76276fa69a4eae77f')
+    pub2 = PublicKey('02530c548d402670b13ad8887ff99c294e67fc18097d236d57880c69261b42def7')
+    pub3 = PublicKey('03e9f948b1bca68c97fd22cc52b6930ca4ed5b1bbaf14e52e95903726df26b814f')
+
     # Create a 2-of-3 multi-signature script using OP_CHECKSIGADD
     multi_sig_script = Script([
-        'pub_key1', 'OP_CHECKSIG',
-        'pub_key2', 'OP_CHECKSIGADD',
-        'pub_key3', 'OP_CHECKSIGADD',
-        '2', 'OP_EQUAL'
+        pub1.to_hex(), 'OP_CHECKSIG',
+        pub2.to_hex(), 'OP_CHECKSIGADD',
+        pub3.to_hex(), 'OP_CHECKSIGADD',
+        'OP_2', 'OP_EQUAL'
     ])
 
     # This is more efficient than the traditional way:
     traditional_multisig = Script([
-        '2', 'pub_key1', 'pub_key2', 'pub_key3', '3', 'OP_CHECKMULTISIG'
+        'OP_2', pub1.to_hex(), pub2.to_hex(), pub3.to_hex(), 'OP_3', 'OP_CHECKMULTISIG'
     ])
