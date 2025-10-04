@@ -323,8 +323,8 @@ Script Path Spending
         tx, 0, 
         [prev_script_pubkey],
         [to_satoshis(0.001)],
-        ext_flag=1,  # Script path spending
-        script=tapscript
+        script_path=True,
+        tapleaf_script=tapscript
     )
 
     # Note: Actual witness data would include the signature, the script, 
