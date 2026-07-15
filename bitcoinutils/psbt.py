@@ -24,6 +24,14 @@ class PSBTInput:
         self.final_scriptsig: Optional[Script] = None
         self.final_scriptwitness: List[bytes] = []
 
+        # BIP-371 Taproot fields
+        self.tap_key_sig: Optional[bytes] = None           # 64 or 65 bytes Schnorr sig
+        self.tap_script_sigs: Dict[Tuple[bytes, bytes], bytes] = {}  # (xonly_pubkey, leaf_hash) -> sig
+        self.tap_leaf_scripts: Dict[bytes, Tuple[bytes, int]] = {}   # control_block -> (script, leaf_version)
+        self.tap_bip32_derivation: Dict[bytes, Tuple[List[bytes], bytes, List[int]]] = {}  # xonly -> (leaf_hashes, fingerprint, path)
+        self.tap_internal_key: Optional[bytes] = None      # 32 bytes x-only pubkey
+        self.tap_merkle_root: Optional[bytes] = None       # 32 bytes merkle root
+
         # Additional fields for validation
         self.ripemd160_preimages: Dict[bytes, bytes] = {}
         self.sha256_preimages: Dict[bytes, bytes] = {}
@@ -41,6 +49,11 @@ class PSBTOutput:
         self.redeem_script: Optional[Script] = None
         self.witness_script: Optional[Script] = None
         self.bip32_derivs: Dict[bytes, Tuple[bytes, List[int]]] = {}  # pubkey -> (fingerprint, path)
+
+        # BIP-371 Taproot fields
+        self.tap_internal_key: Optional[bytes] = None      # 32 bytes x-only pubkey
+        self.tap_tree: Optional[bytes] = None              # raw tap tree bytes
+        self.tap_bip32_derivation: Dict[bytes, Tuple[List[bytes], bytes, List[int]]] = {}  # xonly -> (leaf_hashes, fingerprint, path)
 
         # Proprietary fields
         self.proprietary: Dict[bytes, bytes] = {}
@@ -72,12 +85,23 @@ class PSBT:
         SHA256 = 0x0B
         HASH160 = 0x0C
         HASH256 = 0x0D
+        # BIP-371 Taproot input types
+        TAP_KEY_SIG = 0x13
+        TAP_SCRIPT_SIG = 0x14
+        TAP_LEAF_SCRIPT = 0x15
+        TAP_BIP32_DERIVATION = 0x16
+        TAP_INTERNAL_KEY = 0x17
+        TAP_MERKLE_ROOT = 0x18
         PROPRIETARY = 0xFC
 
     class OutputTypes:
         REDEEM_SCRIPT = 0x00
         WITNESS_SCRIPT = 0x01
         BIP32_DERIVATION = 0x02
+        # BIP-371 Taproot output types
+        TAP_INTERNAL_KEY = 0x05
+        TAP_TREE = 0x06
+        TAP_BIP32_DERIVATION = 0x07
         PROPRIETARY = 0xFC
 
     def _safe_to_bytes(self, obj):
@@ -217,7 +241,44 @@ class PSBT:
                 if prev_tx is None:
                     print(f"Input {input_index} missing both witness_utxo and non_witness_utxo; cannot sign.")
                     return False
-                prev_txout = prev_tx.outputs[self.tx.inputs[input_index].tx_out_index]
+                prev_txout = prev_tx.outputs[self.tx.inputs[input_index].txout_index]
+
+            # --- P2TR (Taproot) key-path signing ---
+            if is_segwit and self._is_p2tr_script(prev_txout.script_pubkey):
+                from bitcoinutils.constants import TAPROOT_SIGHASH_ALL
+                # Collect all witness UTXOs for the Taproot sighash
+                utxos_for_signing = []
+                for i, inp in enumerate(self.inputs):
+                    if inp.witness_utxo is not None:
+                        utxos_for_signing.append(inp.witness_utxo)
+                    elif inp.non_witness_utxo is not None:
+                        utxos_for_signing.append(
+                            inp.non_witness_utxo.outputs[self.tx.inputs[i].txout_index]
+                        )
+                    else:
+                        raise ValueError(f"Input {i} missing UTXO for Taproot sighash")
+
+                # Map PSBT sighash_type to Taproot sighash
+                tap_sighash = sighash_type
+                if tap_sighash == 1:
+                    tap_sighash = 0  # SIGHASH_DEFAULT (== ALL for Taproot)
+
+                sighash_bytes = self.tx.get_transaction_taproot_digest(
+                    input_index, utxos_for_signing, 0, tap_sighash
+                )
+
+                # Schnorr signing
+                sig = private_key.sign_taproot_input(
+                    self.tx, input_index, utxos_for_signing, sighash_type=tap_sighash
+                )
+
+                # If non-default sighash, append the sighash byte
+                if tap_sighash != 0:
+                    psbt_input.tap_key_sig = bytes.fromhex(sig) + bytes([tap_sighash])
+                else:
+                    psbt_input.tap_key_sig = bytes.fromhex(sig)
+
+                return True
 
             # For P2WPKH, we need special handling
             if is_segwit and self._is_p2wpkh_script(prev_txout.script_pubkey):
@@ -740,10 +801,6 @@ class PSBT:
         if self._is_input_finalized(psbt_input):
             return True
 
-        # Need partial signatures to finalize
-        if not psbt_input.partial_sigs:
-            return False
-
         # Get UTXO info
         if psbt_input.witness_utxo:
             prev_output = psbt_input.witness_utxo
@@ -753,6 +810,14 @@ class PSBT:
             prev_output = psbt_input.non_witness_utxo.outputs[prev_vout]
             script_pubkey = prev_output.script_pubkey
         else:
+            return False
+
+        # Handle P2TR first (uses tap_key_sig, not partial_sigs)
+        if self._is_p2tr_script(script_pubkey):
+            return self._finalize_p2tr(psbt_input)
+
+        # Need partial signatures to finalize non-Taproot inputs
+        if not psbt_input.partial_sigs:
             return False
 
         # Handle different script types with improved detection
@@ -765,8 +830,6 @@ class PSBT:
                 return self._finalize_p2sh(psbt_input)
             elif script_pubkey.is_p2wsh():
                 return self._finalize_p2wsh(psbt_input)
-            elif self._is_p2tr_script(script_pubkey):
-                return self._finalize_p2tr(psbt_input)
         except Exception:
             pass
 
@@ -913,14 +976,26 @@ class PSBT:
             return self._finalize_script(psbt_input, witness_script, is_witness=True)
 
     def _finalize_p2tr(self, psbt_input: PSBTInput) -> bool:
-        """Finalize P2TR (Taproot) input."""
-        if len(psbt_input.partial_sigs) != 1:
-            return False
+        """Finalize P2TR (Taproot) key-path input using tap_key_sig."""
+        if psbt_input.tap_key_sig is None:
+            raise ValueError("Cannot finalize P2TR input: tap_key_sig is not set")
 
-        # For key-path spending, we expect a single signature
-        signature = next(iter(psbt_input.partial_sigs.values()))
         psbt_input.final_scriptsig = Script([])
-        psbt_input.final_scriptwitness = [signature]
+        psbt_input.final_scriptwitness = [psbt_input.tap_key_sig]
+
+        # Clear intermediate Taproot fields per BIP-174/371
+        psbt_input.tap_key_sig = None
+        psbt_input.tap_script_sigs = {}
+        psbt_input.tap_leaf_scripts = {}
+        psbt_input.tap_bip32_derivation = {}
+        psbt_input.tap_internal_key = None
+        psbt_input.tap_merkle_root = None
+        psbt_input.partial_sigs = {}
+        psbt_input.sighash_type = None
+        psbt_input.redeem_script = None
+        psbt_input.witness_script = None
+        psbt_input.bip32_derivs = {}
+
         return True
 
     def _finalize_script(self, psbt_input: PSBTInput, script: Script, is_witness: bool) -> bool:
@@ -1100,6 +1175,73 @@ class PSBT:
                 psbt_input.hash160_preimages[key_data] = value_data
             elif key_type == self.InputTypes.HASH256:
                 psbt_input.hash256_preimages[key_data] = value_data
+            # BIP-371 Taproot input fields
+            elif key_type == self.InputTypes.TAP_KEY_SIG:
+                if len(value_data) not in (64, 65):
+                    raise ValueError(
+                        f"Invalid tap_key_sig length {len(value_data)}: "
+                        "expected 64 or 65 bytes"
+                    )
+                psbt_input.tap_key_sig = value_data
+            elif key_type == self.InputTypes.TAP_SCRIPT_SIG:
+                # key_data includes type byte prefix already stripped;
+                # remaining = x-only pubkey(32) + leaf_hash(32)
+                if len(key_data) != 64:
+                    raise ValueError(
+                        f"Invalid tap_script_sig key length {len(key_data)}: "
+                        "expected 64 bytes (32 + 32)"
+                    )
+                if len(value_data) not in (64, 65):
+                    raise ValueError(
+                        f"Invalid tap_script_sig length {len(value_data)}: "
+                        "expected 64 or 65 bytes"
+                    )
+                xonly_pubkey = key_data[:32]
+                leaf_hash = key_data[32:64]
+                psbt_input.tap_script_sigs[(xonly_pubkey, leaf_hash)] = value_data
+            elif key_type == self.InputTypes.TAP_LEAF_SCRIPT:
+                control_block = key_data
+                cb_len = len(control_block)
+                if cb_len < 33 or (cb_len - 33) % 32 != 0:
+                    raise ValueError(
+                        f"Invalid tap_leaf_script control block length {cb_len}"
+                    )
+                if len(value_data) < 1:
+                    raise ValueError("Empty tap_leaf_script value")
+                leaf_ver = value_data[-1]
+                script_bytes = value_data[:-1]
+                psbt_input.tap_leaf_scripts[control_block] = (script_bytes, leaf_ver)
+            elif key_type == self.InputTypes.TAP_BIP32_DERIVATION:
+                if len(key_data) != 32:
+                    raise ValueError(
+                        f"Invalid tap_bip32_derivation key length {len(key_data)}: "
+                        "expected 32 bytes"
+                    )
+                xonly = key_data
+                vstream = BytesIO(value_data)
+                num_hashes_b = vstream.read(1)
+                num_hashes = num_hashes_b[0] if num_hashes_b else 0
+                leaf_hashes = []
+                for _ in range(num_hashes):
+                    leaf_hashes.append(vstream.read(32))
+                fingerprint = vstream.read(4)
+                remaining = vstream.read()
+                path = list(struct.unpack('<' + 'I' * (len(remaining) // 4), remaining))
+                psbt_input.tap_bip32_derivation[xonly] = (leaf_hashes, fingerprint, path)
+            elif key_type == self.InputTypes.TAP_INTERNAL_KEY:
+                if len(value_data) != 32:
+                    raise ValueError(
+                        f"Invalid tap_internal_key length {len(value_data)}: "
+                        "expected 32 bytes"
+                    )
+                psbt_input.tap_internal_key = value_data
+            elif key_type == self.InputTypes.TAP_MERKLE_ROOT:
+                if len(value_data) != 32:
+                    raise ValueError(
+                        f"Invalid tap_merkle_root length {len(value_data)}: "
+                        "expected 32 bytes"
+                    )
+                psbt_input.tap_merkle_root = value_data
             elif key_type == self.InputTypes.PROPRIETARY:
                 psbt_input.proprietary[key_data] = value_data
             else:
@@ -1124,6 +1266,33 @@ class PSBT:
                 fingerprint = struct.unpack('<I', value_data[:4])[0]
                 path = list(struct.unpack('<' + 'I' * ((len(value_data) - 4) // 4), value_data[4:]))
                 psbt_output.bip32_derivs[key_data] = (fingerprint, path)
+            # BIP-371 Taproot output fields
+            elif key_type == self.OutputTypes.TAP_INTERNAL_KEY:
+                if len(value_data) != 32:
+                    raise ValueError(
+                        f"Invalid output tap_internal_key length {len(value_data)}: "
+                        "expected 32 bytes"
+                    )
+                psbt_output.tap_internal_key = value_data
+            elif key_type == self.OutputTypes.TAP_TREE:
+                psbt_output.tap_tree = value_data
+            elif key_type == self.OutputTypes.TAP_BIP32_DERIVATION:
+                if len(key_data) != 32:
+                    raise ValueError(
+                        f"Invalid output tap_bip32_derivation key length {len(key_data)}: "
+                        "expected 32 bytes"
+                    )
+                xonly = key_data
+                vstream = BytesIO(value_data)
+                num_hashes_b = vstream.read(1)
+                num_hashes = num_hashes_b[0] if num_hashes_b else 0
+                leaf_hashes = []
+                for _ in range(num_hashes):
+                    leaf_hashes.append(vstream.read(32))
+                fingerprint = vstream.read(4)
+                remaining = vstream.read()
+                path = list(struct.unpack('<' + 'I' * (len(remaining) // 4), remaining))
+                psbt_output.tap_bip32_derivation[xonly] = (leaf_hashes, fingerprint, path)
             elif key_type == self.OutputTypes.PROPRIETARY:
                 psbt_output.proprietary[key_data] = value_data
             else:
@@ -1306,6 +1475,32 @@ class PSBT:
         for hash_val, preimage in psbt_input.hash256_preimages.items():
             self._write_key_value_pair(result, self.InputTypes.HASH256, hash_val, preimage)
         
+        # BIP-371 Taproot input fields
+        if psbt_input.tap_key_sig is not None:
+            self._write_key_value_pair(result, self.InputTypes.TAP_KEY_SIG, b'', psbt_input.tap_key_sig)
+        
+        for (xonly_pubkey, leaf_hash), sig in psbt_input.tap_script_sigs.items():
+            key_data = xonly_pubkey + leaf_hash
+            self._write_key_value_pair(result, self.InputTypes.TAP_SCRIPT_SIG, key_data, sig)
+        
+        for control_block, (script_bytes, leaf_ver) in psbt_input.tap_leaf_scripts.items():
+            value_data = script_bytes + bytes([leaf_ver])
+            self._write_key_value_pair(result, self.InputTypes.TAP_LEAF_SCRIPT, control_block, value_data)
+        
+        for xonly, (leaf_hashes, fingerprint, path) in psbt_input.tap_bip32_derivation.items():
+            value_data = bytes([len(leaf_hashes)])
+            for lh in leaf_hashes:
+                value_data += lh
+            value_data += fingerprint
+            value_data += struct.pack('<' + 'I' * len(path), *path)
+            self._write_key_value_pair(result, self.InputTypes.TAP_BIP32_DERIVATION, xonly, value_data)
+        
+        if psbt_input.tap_internal_key is not None:
+            self._write_key_value_pair(result, self.InputTypes.TAP_INTERNAL_KEY, b'', psbt_input.tap_internal_key)
+        
+        if psbt_input.tap_merkle_root is not None:
+            self._write_key_value_pair(result, self.InputTypes.TAP_MERKLE_ROOT, b'', psbt_input.tap_merkle_root)
+        
         # Proprietary and unknown
         for key_data, value_data in psbt_input.proprietary.items():
             self._write_key_value_pair(result, self.InputTypes.PROPRIETARY, key_data, value_data)
@@ -1344,6 +1539,21 @@ class PSBT:
             value_data = struct.pack('<I', fingerprint) + struct.pack('<' + 'I' * len(path), *path)
             pubkey_bytes = pubkey if isinstance(pubkey, bytes) else self._safe_to_bytes(pubkey)
             self._write_key_value_pair(result, self.OutputTypes.BIP32_DERIVATION, pubkey_bytes, value_data)
+        
+        # BIP-371 Taproot output fields
+        if psbt_output.tap_internal_key is not None:
+            self._write_key_value_pair(result, self.OutputTypes.TAP_INTERNAL_KEY, b'', psbt_output.tap_internal_key)
+        
+        if psbt_output.tap_tree is not None:
+            self._write_key_value_pair(result, self.OutputTypes.TAP_TREE, b'', psbt_output.tap_tree)
+        
+        for xonly, (leaf_hashes, fingerprint, path) in psbt_output.tap_bip32_derivation.items():
+            value_data = bytes([len(leaf_hashes)])
+            for lh in leaf_hashes:
+                value_data += lh
+            value_data += fingerprint
+            value_data += struct.pack('<' + 'I' * len(path), *path)
+            self._write_key_value_pair(result, self.OutputTypes.TAP_BIP32_DERIVATION, xonly, value_data)
         
         # Proprietary and unknown
         for key_data, value_data in psbt_output.proprietary.items():
