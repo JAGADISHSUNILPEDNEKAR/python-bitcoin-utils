@@ -3,18 +3,25 @@ python-bitcoin-utils
 
 This is a bitcoin library that provides tools/utilities to interact with the Bitcoin network. One of the primary goals of the library is to explain the low-level details of Bitcoin. The code is easy to read and properly documented explaining in detail all the thorny aspects of the implementation. It is a low-level library which assumes some high-level understanding of how Bitcoin works. In the future this might change.
 
-This is an early version of the library (v0.7.2) and currently, it supports private/public keys, all type of addresses and creation of any transaction, incl. segwit and taproot, with all SIGHASH types. All script op codes are included. Block parsing is also handled so you can read raw blocks directly. Extra functionality will be added continuously and the documentation will be improved as the work progresses.
+The library (v0.8.4) currently supports private/public keys, all type of addresses and creation of any transaction, incl. segwit and taproot, with all SIGHASH types. All script op codes are included. Block parsing is also handled so you can read raw blocks directly. PSBT (BIP-174) is supported. A small fixed-key output descriptor module is also included for converting common descriptors such as ``wpkh(KEY)``, ``sh(wpkh(KEY))``, ``wsh(multi(...))``, ``tr(KEY)``, ``addr(ADDRESS)`` and ``raw(HEX)`` into scripts and addresses. Extra functionality will be added continuously and the documentation will be improved as the work progresses.
 
 The API documentation can be build with Sphinx but is also available as a PDF for convenience. One can currently use the library for experimenting and learning the inner workings of Bitcoin. It is not meant for production yet and parts of the API might be updated with new versions.
 
 Complementary to this library is a CC BY-SA 4.0 licensed `Bitcoin programming book <https://github.com/karask/bitcoin-textbook>`_.
 
+Security model
+--------------
+This library is intentionally pure Python and educational. Private-key operations, including ECDSA signing and Taproot/Schnorr signing, are not side-channel hardened and should not be used to protect real funds in timing-observable environments. 
+
+The ``python-ecdsa`` dependency has a known Minerva timing-attack advisory (CVE-2024-23342) with no patched pure-Python release. Keeping the library pure Python means this class of side-channel risk cannot be fully eliminated. Use the library for learning, tests, testnet, offline experiments, and transaction construction; use production wallets, hardware signers, or hardened native cryptographic libraries for real funds.
+
+Private-key warnings are enabled by default on mainnet and can be disabled with ``bitcoinutils.setup.set_security_warnings(False)``. Testnet, testnet4, signet and regtest do not emit the warning by default, so educational examples stay quiet.
+
 
 Notes
 -----
 * For schnorr, bech32[m], ripemd160 the python Bitcoin Core reference implementations are used.
-* For making calls to a Bitcoin node a simple node proxy object exists, which wraps the python-bitcoinrpc library.
-* For Hierarchical Deterministic keys we wrap the python hdwallet library. For now we wrap only some very basic functionality to acquire a PrivateKey object that is used throughtout the library.
+* For Hierarchical Deterministic keys we include minimal native BIP-32/BIP-39 functionality to acquire a PrivateKey object that is used throughtout the library.
 
 
 Installation
@@ -128,6 +135,24 @@ https://github.com/karask/python-bitcoin-utils/blob/master/examples/send_to_p2tr
 
 Spend taproot from script path (has three alternative script path spends - A, B and C)
 https://github.com/karask/python-bitcoin-utils/blob/master/examples/spend_p2tr_three_scripts_by_script_path.py - single input, single output, spend script path B.
+
+Send to Taproot address that contains four script path spends
+https://github.com/aaron-recompile/python-bitcoin-utils/blob/taproot-4leaf-example/examples/send_to_p2tr_with_four_scripts.py - builds a Taproot address with four scripts (hashlock, multisig, CSV, siglock).
+
+Spend Taproot from script path (has four alternative script path spends - A, B, C, and D)
+https://github.com/aaron-recompile/python-bitcoin-utils/blob/taproot-4leaf-example/examples/spend_p2tr_four_scripts_by_script_path.py - spends from any of the 4 script paths using control blocks and full validation.
+
+Partially Signed Bitcoin Transactions (PSBT)
+--------------------------------------------
+
+Multisig (2-of-3) example with PSBT to transfer intermediate tx states
+https://github.com/karask/python-bitcoin-utils/blob/master/examples/psbt/ - folder explains workflow and script usage
+
+Output Descriptors
+------------------
+
+Fixed-key output descriptors are supported through ``bitcoinutils.descriptors``. The module parses a practical educational subset of Bitcoin Core descriptors, validates/generates descriptor checksums, and converts descriptors to ``Script`` and address objects.
+
 
 Other
 -----

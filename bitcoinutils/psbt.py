@@ -1,1577 +1,1105 @@
+# Copyright (C) 2018-2025 The python-bitcoin-utils developers
+#
+# This file is part of python-bitcoin-utils
+#
+# It is subject to the license terms in the LICENSE file found in the top-level
+# directory of this distribution.
+#
+# No part of python-bitcoin-utils, including this file, may be copied, modified,
+# propagated, or distributed except according to the terms contained in the
+# LICENSE file.
+
+"""BIP-0174 Partially Signed Bitcoin Transaction (PSBT) support.
+
+Implements PSBT version 0 per https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
+"""
+
 import struct
 from io import BytesIO
-import ecdsa
-from ecdsa import SECP256k1, SigningKey
-from typing import Dict, List, Optional, Tuple, Union
-from bitcoinutils.transactions import Transaction, TxInput, TxOutput
-from bitcoinutils.script import Script
-from bitcoinutils.keys import PrivateKey, PublicKey
-from bitcoinutils.utils import to_satoshis
-from bitcoinutils.utils import encode_varint
-from bitcoinutils.utils import read_varint
+from typing import Optional
+import base64
+
+from bitcoinutils.constants import SIGHASH_ALL
+from bitcoinutils.script import (
+    Script,
+    is_p2pkh as _is_p2pkh,
+    is_p2sh as _is_p2sh,
+    is_p2wpkh as _is_p2wpkh,
+    is_p2wsh as _is_p2wsh,
+    is_p2tr as _is_p2tr,
+)
+from bitcoinutils.transactions import (
+    Transaction,
+    TxInput,
+    TxOutput,
+    TxWitnessInput,
+)
+from bitcoinutils.utils import (
+    encode_varint,
+    parse_compact_size,
+    h_to_b,
+    b_to_h,
+)
+
+# PSBT magic bytes
+PSBT_MAGIC = b"psbt\xff"
+
+# Global types
+PSBT_GLOBAL_UNSIGNED_TX = 0x00
+PSBT_GLOBAL_XPUB = 0x01
+
+# Per-input types
+PSBT_IN_NON_WITNESS_UTXO = 0x00
+PSBT_IN_WITNESS_UTXO = 0x01
+PSBT_IN_PARTIAL_SIG = 0x02
+PSBT_IN_SIGHASH_TYPE = 0x03
+PSBT_IN_REDEEM_SCRIPT = 0x04
+PSBT_IN_WITNESS_SCRIPT = 0x05
+PSBT_IN_BIP32_DERIVATION = 0x06
+PSBT_IN_FINAL_SCRIPTSIG = 0x07
+PSBT_IN_FINAL_SCRIPTWITNESS = 0x08
+
+# Per-output types
+PSBT_OUT_REDEEM_SCRIPT = 0x00
+PSBT_OUT_WITNESS_SCRIPT = 0x01
+PSBT_OUT_BIP32_DERIVATION = 0x02
+
+# BIP-371 Taproot input types
+PSBT_IN_TAP_KEY_SIG = 0x13
+PSBT_IN_TAP_SCRIPT_SIG = 0x14
+PSBT_IN_TAP_LEAF_SCRIPT = 0x15
+PSBT_IN_TAP_BIP32_DERIVATION = 0x16
+PSBT_IN_TAP_INTERNAL_KEY = 0x17
+PSBT_IN_TAP_MERKLE_ROOT = 0x18
+
+# BIP-371 Taproot output types
+PSBT_OUT_TAP_INTERNAL_KEY = 0x05
+PSBT_OUT_TAP_TREE = 0x06
+PSBT_OUT_TAP_BIP32_DERIVATION = 0x07
+
+
+# Sets of known key types for validation
+_KNOWN_INPUT_SINGLE_BYTE_KEYS = {
+    PSBT_IN_NON_WITNESS_UTXO,
+    PSBT_IN_WITNESS_UTXO,
+    PSBT_IN_SIGHASH_TYPE,
+    PSBT_IN_REDEEM_SCRIPT,
+    PSBT_IN_WITNESS_SCRIPT,
+    PSBT_IN_FINAL_SCRIPTSIG,
+    PSBT_IN_FINAL_SCRIPTWITNESS,
+    PSBT_IN_TAP_KEY_SIG,
+    PSBT_IN_TAP_INTERNAL_KEY,
+    PSBT_IN_TAP_MERKLE_ROOT,
+}
+
+_KNOWN_INPUT_PUBKEY_KEYS = {
+    PSBT_IN_PARTIAL_SIG,
+    PSBT_IN_BIP32_DERIVATION,
+}
+
+_KNOWN_OUTPUT_SINGLE_BYTE_KEYS = {
+    PSBT_OUT_REDEEM_SCRIPT,
+    PSBT_OUT_WITNESS_SCRIPT,
+    PSBT_OUT_TAP_INTERNAL_KEY,
+    PSBT_OUT_TAP_TREE,
+}
+
+_KNOWN_OUTPUT_PUBKEY_KEYS = {
+    PSBT_OUT_BIP32_DERIVATION,
+}
+
+
+def _validate_pubkey_length(pubkey: bytes, context: str) -> None:
+    """Validate that a pubkey is 33 (compressed) or 65 (uncompressed) bytes."""
+    if len(pubkey) not in (33, 65):
+        raise ValueError(
+            f"Invalid public key length {len(pubkey)} in {context}: "
+            "expected 33 (compressed) or 65 (uncompressed)"
+        )
+
+
+# Map OP_n strings to integer n
+_OP_N_MAP = {f"OP_{i}": i for i in range(1, 17)}
+
+
+def _parse_multisig(script: Script):
+    """Parse a bare multisig script.
+
+    Returns (m, n, [pubkey_hex_strings]) or None if not multisig.
+    """
+    s = script.script
+    if len(s) < 4:
+        return None
+    if s[-1] != "OP_CHECKMULTISIG":
+        return None
+    m_op = s[0]
+    n_op = s[-2]
+    m = _OP_N_MAP.get(m_op)
+    n = _OP_N_MAP.get(n_op)
+    if m is None or n is None:
+        return None
+    pubkeys = s[1:-2]
+    if len(pubkeys) != n:
+        return None
+    return (m, n, pubkeys)
+
+
+def _read_compact_size_from_stream(stream: BytesIO) -> int:
+    """Read a compact size integer from a BytesIO stream."""
+    first = stream.read(1)
+    if len(first) == 0:
+        raise ValueError("Unexpected end of stream reading compact size")
+    fb = first[0]
+    if fb < 0xFD:
+        return fb
+    elif fb == 0xFD:
+        return struct.unpack("<H", stream.read(2))[0]
+    elif fb == 0xFE:
+        return struct.unpack("<I", stream.read(4))[0]
+    else:
+        return struct.unpack("<Q", stream.read(8))[0]
+
+
+def _read_kv_pair(stream: BytesIO):
+    """Read a key-value pair from PSBT stream.
+
+    Returns (key_bytes, value_bytes) or None if separator (0x00) encountered.
+    """
+    key_len = _read_compact_size_from_stream(stream)
+    if key_len == 0:
+        return None
+    key_data = stream.read(key_len)
+    if len(key_data) != key_len:
+        raise ValueError("Truncated PSBT key data")
+    value_len = _read_compact_size_from_stream(stream)
+    value_data = stream.read(value_len)
+    if len(value_data) != value_len:
+        raise ValueError("Truncated PSBT value data")
+    return (key_data, value_data)
+
+
+def _write_kv(key_type: int, key_data: bytes, value: bytes) -> bytes:
+    """Serialize a single PSBT key-value pair."""
+    key = bytes([key_type]) + key_data
+    return encode_varint(len(key)) + key + encode_varint(len(value)) + value
+
+
+def _write_kv_simple(key_type: int, value: bytes) -> bytes:
+    """Serialize a key-value pair where the key is just the type byte."""
+    key = bytes([key_type])
+    return encode_varint(len(key)) + key + encode_varint(len(value)) + value
+
+
+# ---------------------------------------------------------------------------
+# PSBTInput / PSBTOutput data containers
+# ---------------------------------------------------------------------------
 
 class PSBTInput:
+    """Data associated with a single PSBT input."""
 
     def __init__(self):
-        # BIP-174 defined fields
         self.non_witness_utxo: Optional[Transaction] = None
         self.witness_utxo: Optional[TxOutput] = None
-        self.partial_sigs: Dict[bytes, bytes] = {}  # pubkey -> signature
+        self.partial_sigs: dict[bytes, bytes] = {}  # pubkey -> sig
         self.sighash_type: Optional[int] = None
         self.redeem_script: Optional[Script] = None
         self.witness_script: Optional[Script] = None
-        self.bip32_derivs: Dict[bytes, Tuple[bytes, List[int]]] = {}  # pubkey -> (fingerprint, path)
+        self.bip32_derivs: dict[bytes, tuple[bytes, list[int]]] = {}
         self.final_scriptsig: Optional[Script] = None
-        self.final_scriptwitness: List[bytes] = []
+        self.final_scriptwitness: Optional[list[bytes]] = None
+                        self.unknown: dict[bytes, bytes] = {}
 
         # BIP-371 Taproot fields
-        self.tap_key_sig: Optional[bytes] = None           # 64 or 65 bytes Schnorr sig
-        self.tap_script_sigs: Dict[Tuple[bytes, bytes], bytes] = {}  # (xonly_pubkey, leaf_hash) -> sig
-        self.tap_leaf_scripts: Dict[bytes, Tuple[bytes, int]] = {}   # control_block -> (script, leaf_version)
-        self.tap_bip32_derivation: Dict[bytes, Tuple[List[bytes], bytes, List[int]]] = {}  # xonly -> (leaf_hashes, fingerprint, path)
-        self.tap_internal_key: Optional[bytes] = None      # 32 bytes x-only pubkey
-        self.tap_merkle_root: Optional[bytes] = None       # 32 bytes merkle root
+        self.tap_internal_key: Optional[bytes] = None
+        self.tap_tree: Optional[bytes] = None
+        self.tap_bip32_derivation: dict[bytes, tuple[list[bytes], bytes, list[int]]] = {}
 
-        # Additional fields for validation
-        self.ripemd160_preimages: Dict[bytes, bytes] = {}
-        self.sha256_preimages: Dict[bytes, bytes] = {}
-        self.hash160_preimages: Dict[bytes, bytes] = {}
-        self.hash256_preimages: Dict[bytes, bytes] = {}
+        # BIP-371 Taproot fields
+        self.tap_key_sig: Optional[bytes] = None
+        self.tap_script_sigs: dict[tuple[bytes, bytes], bytes] = {}
+        self.tap_leaf_scripts: dict[bytes, tuple[bytes, int]] = {}
+        self.tap_bip32_derivation: dict[bytes, tuple[list[bytes], bytes, list[int]]] = {}
+        self.tap_internal_key: Optional[bytes] = None
+        self.tap_merkle_root: Optional[bytes] = None
 
-        # Proprietary fields
-        self.proprietary: Dict[bytes, bytes] = {}
-        self.unknown: Dict[bytes, bytes] = {}
 
 class PSBTOutput:
+    """Data associated with a single PSBT output."""
 
     def __init__(self):
-        # BIP-174 defined fields
         self.redeem_script: Optional[Script] = None
         self.witness_script: Optional[Script] = None
-        self.bip32_derivs: Dict[bytes, Tuple[bytes, List[int]]] = {}  # pubkey -> (fingerprint, path)
+        self.bip32_derivs: dict[bytes, tuple[bytes, list[int]]] = {}
+                self.unknown: dict[bytes, bytes] = {}
 
         # BIP-371 Taproot fields
-        self.tap_internal_key: Optional[bytes] = None      # 32 bytes x-only pubkey
-        self.tap_tree: Optional[bytes] = None              # raw tap tree bytes
-        self.tap_bip32_derivation: Dict[bytes, Tuple[List[bytes], bytes, List[int]]] = {}  # xonly -> (leaf_hashes, fingerprint, path)
+        self.tap_internal_key: Optional[bytes] = None
+        self.tap_tree: Optional[bytes] = None
+        self.tap_bip32_derivation: dict[bytes, tuple[list[bytes], bytes, list[int]]] = {}
 
-        # Proprietary fields
-        self.proprietary: Dict[bytes, bytes] = {}
-        self.unknown: Dict[bytes, bytes] = {}
+
+# ---------------------------------------------------------------------------
+# Main PSBT class
+# ---------------------------------------------------------------------------
 
 class PSBT:
-    # PSBT magic bytes and version
-    MAGIC = b'psbt'
-    VERSION = 0
+    """BIP-174 Partially Signed Bitcoin Transaction (version 0).
 
-    # Key types as defined in BIP-174
-    class GlobalTypes:
-        UNSIGNED_TX = 0x00
-        XPUB = 0x01
-        VERSION = 0xFB
-        PROPRIETARY = 0xFC
+    Attributes
+    ----------
+    tx : Transaction
+        The unsigned transaction (no scriptSigs, no segwit flag).
+    inputs : list[PSBTInput]
+        Per-input metadata, partial signatures, etc.
+    outputs : list[PSBTOutput]
+        Per-output metadata.
+    unknown_global : dict[bytes, bytes]
+        Unknown global key-value pairs.
+    """
 
-    class InputTypes:
-        NON_WITNESS_UTXO = 0x00
-        WITNESS_UTXO = 0x01
-        PARTIAL_SIG = 0x02
-        SIGHASH_TYPE = 0x03
-        REDEEM_SCRIPT = 0x04
-        WITNESS_SCRIPT = 0x05
-        BIP32_DERIVATION = 0x06
-        FINAL_SCRIPTSIG = 0x07
-        FINAL_SCRIPTWITNESS = 0x08
-        RIPEMD160 = 0x0A
-        SHA256 = 0x0B
-        HASH160 = 0x0C
-        HASH256 = 0x0D
-        # BIP-371 Taproot input types
-        TAP_KEY_SIG = 0x13
-        TAP_SCRIPT_SIG = 0x14
-        TAP_LEAF_SCRIPT = 0x15
-        TAP_BIP32_DERIVATION = 0x16
-        TAP_INTERNAL_KEY = 0x17
-        TAP_MERKLE_ROOT = 0x18
-        PROPRIETARY = 0xFC
+    def __init__(self, tx: Transaction):
+        # Deep copy and strip scriptSigs / segwit data
+        self.tx = Transaction.copy(tx)
+        for inp in self.tx.inputs:
+            inp.script_sig = Script([])
+        self.tx.has_segwit = False
+        self.tx.witnesses = []
 
-    class OutputTypes:
-        REDEEM_SCRIPT = 0x00
-        WITNESS_SCRIPT = 0x01
-        BIP32_DERIVATION = 0x02
-        # BIP-371 Taproot output types
-        TAP_INTERNAL_KEY = 0x05
-        TAP_TREE = 0x06
-        TAP_BIP32_DERIVATION = 0x07
-        PROPRIETARY = 0xFC
+        self.inputs: list[PSBTInput] = [PSBTInput() for _ in self.tx.inputs]
+        self.outputs: list[PSBTOutput] = [PSBTOutput() for _ in self.tx.outputs]
+        self.unknown_global: dict[bytes, bytes] = {}
 
-    def _safe_to_bytes(self, obj):
-        if isinstance(obj, Script):
-            return obj.to_bytes()
-        elif hasattr(obj, 'to_bytes'):
-            return obj.to_bytes()
-        elif isinstance(obj, bytes):
-            return obj
-        elif isinstance(obj, str):
-            return obj.encode()
-        else:
-            raise TypeError(f"Cannot convert {type(obj)} to bytes")
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
 
+    def to_bytes(self) -> bytes:
+        """Serialize this PSBT to binary format."""
+        result = PSBT_MAGIC
 
-    def _safe_serialize_transaction(self, tx) -> bytes:
-        """Safely serialize a transaction to bytes."""
-        if isinstance(tx, bytes):
-            return tx
+        # --- Global map ---
+        # Unsigned transaction (non-segwit serialization)
+        tx_bytes = self.tx.to_bytes(False)
+        result += _write_kv_simple(PSBT_GLOBAL_UNSIGNED_TX, tx_bytes)
+        for k, v in self.unknown_global.items():
+            result += encode_varint(len(k)) + k + encode_varint(len(v)) + v
+        result += b"\x00"  # separator
+
+        # --- Input maps ---
+        for psi in self.inputs:
+            result += self._serialize_input(psi)
+            result += b"\x00"  # separator
+
+        # --- Output maps ---
+        for pso in self.outputs:
+            result += self._serialize_output(pso)
+            result += b"\x00"  # separator
+
+        return result
+
+    @staticmethod
+    def _serialize_input(psi: PSBTInput) -> bytes:
+        data = b""
+        if psi.non_witness_utxo is not None:
+            tx_bytes = psi.non_witness_utxo.to_bytes(psi.non_witness_utxo.has_segwit)
+            data += _write_kv_simple(PSBT_IN_NON_WITNESS_UTXO, tx_bytes)
+        if psi.witness_utxo is not None:
+            data += _write_kv_simple(PSBT_IN_WITNESS_UTXO, psi.witness_utxo.to_bytes())
+        for pubkey, sig in psi.partial_sigs.items():
+            data += _write_kv(PSBT_IN_PARTIAL_SIG, pubkey, sig)
+        if psi.sighash_type is not None:
+            data += _write_kv_simple(
+                PSBT_IN_SIGHASH_TYPE, struct.pack("<I", psi.sighash_type)
+            )
+        if psi.redeem_script is not None:
+            data += _write_kv_simple(PSBT_IN_REDEEM_SCRIPT, psi.redeem_script.to_bytes())
+        if psi.witness_script is not None:
+            data += _write_kv_simple(
+                PSBT_IN_WITNESS_SCRIPT, psi.witness_script.to_bytes()
+            )
+        for pubkey, (fp, path) in psi.bip32_derivs.items():
+            value = fp
+            for idx in path:
+                value += struct.pack("<I", idx)
+            data += _write_kv(PSBT_IN_BIP32_DERIVATION, pubkey, value)
+        if psi.final_scriptsig is not None:
+            data += _write_kv_simple(
+                PSBT_IN_FINAL_SCRIPTSIG, psi.final_scriptsig.to_bytes()
+            )
+        if psi.final_scriptwitness is not None:
+            wit_data = encode_varint(len(psi.final_scriptwitness))
+            for item in psi.final_scriptwitness:
+                wit_data += encode_varint(len(item)) + item
+            data += _write_kv_simple(PSBT_IN_FINAL_SCRIPTWITNESS, wit_data)
+        for k, v in psi.unknown.items():
+            data += encode_varint(len(k)) + k + encode_varint(len(v)) + v
+
+        # BIP-371 Taproot fields
+        if psi.tap_key_sig is not None:
+            data += _write_kv_simple(PSBT_IN_TAP_KEY_SIG, psi.tap_key_sig)
+        for (pubkey, leaf_hash), sig in psi.tap_script_sigs.items():
+            data += _write_kv(PSBT_IN_TAP_SCRIPT_SIG, pubkey + leaf_hash, sig)
+        for control_block, (script, leaf_ver) in psi.tap_leaf_scripts.items():
+            data += _write_kv(PSBT_IN_TAP_LEAF_SCRIPT, control_block, script + bytes([leaf_ver]))
+        for pubkey, (leaf_hashes, fp, path) in psi.tap_bip32_derivation.items():
+            value = b"".join(leaf_hashes) + fp
+            for idx in path:
+                value += struct.pack("<I", idx)
+            data += _write_kv(PSBT_IN_TAP_BIP32_DERIVATION, pubkey, value)
+        if psi.tap_internal_key is not None:
+            data += _write_kv_simple(PSBT_IN_TAP_INTERNAL_KEY, psi.tap_internal_key)
+        if psi.tap_merkle_root is not None:
+            data += _write_kv_simple(PSBT_IN_TAP_MERKLE_ROOT, psi.tap_merkle_root)
         
-        serialized = tx.serialize()
-        if isinstance(serialized, str):
-            return bytes.fromhex(serialized)
-        return serialized
+        return data
 
-    def __init__(self, unsigned_tx: Optional[Transaction] = None):
+    @staticmethod
+    def _serialize_output(pso: PSBTOutput) -> bytes:
+        data = b""
+        if pso.redeem_script is not None:
+            data += _write_kv_simple(PSBT_OUT_REDEEM_SCRIPT, pso.redeem_script.to_bytes())
+        if pso.witness_script is not None:
+            data += _write_kv_simple(
+                PSBT_OUT_WITNESS_SCRIPT, pso.witness_script.to_bytes()
+            )
+        for pubkey, (fp, path) in pso.bip32_derivs.items():
+            value = fp
+            for idx in path:
+                value += struct.pack("<I", idx)
+            data += _write_kv(PSBT_OUT_BIP32_DERIVATION, pubkey, value)
+        for k, v in pso.unknown.items():
+            data += encode_varint(len(k)) + k + encode_varint(len(v)) + v
+
+        # BIP-371 Taproot fields
+        if pso.tap_internal_key is not None:
+            data += _write_kv_simple(PSBT_OUT_TAP_INTERNAL_KEY, pso.tap_internal_key)
+        if pso.tap_tree is not None:
+            data += _write_kv_simple(PSBT_OUT_TAP_TREE, pso.tap_tree)
+        for pubkey, (leaf_hashes, fp, path) in pso.tap_bip32_derivation.items():
+            value = b"".join(leaf_hashes) + fp
+            for idx in path:
+                value += struct.pack("<I", idx)
+            data += _write_kv(PSBT_OUT_TAP_BIP32_DERIVATION, pubkey, value)
+
+        return data
+
+    def to_base64(self) -> str:
+        """Serialize to base64 string."""
+        return base64.b64encode(self.to_bytes()).decode("ascii")
+
+    def to_hex(self) -> str:
+        """Serialize to hex string."""
+        return b_to_h(self.to_bytes())
+
+    # ------------------------------------------------------------------
+    # Deserialization
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "PSBT":
+        """Deserialize a PSBT from raw bytes."""
+        if data[:5] != PSBT_MAGIC:
+            raise ValueError("Invalid PSBT magic bytes")
+        stream = BytesIO(data[5:])
+
+        # --- Global map ---
+        unsigned_tx = None
+        unknown_global: dict[bytes, bytes] = {}
+        seen_global_keys: set[bytes] = set()
+
+        while True:
+            kv = _read_kv_pair(stream)
+            if kv is None:
+                break
+            key_data, value_data = kv
+            if key_data in seen_global_keys:
+                raise ValueError("Duplicate key in global map")
+            seen_global_keys.add(key_data)
+
+            key_type = key_data[0]
+            if key_type == PSBT_GLOBAL_UNSIGNED_TX:
+                if len(key_data) != 1:
+                    raise ValueError(
+                        "Invalid global unsigned tx key: must be single byte"
+                    )
+                # Detect witness serialization: version(4) + marker(0x00) + flag(0x01)
+                if len(value_data) >= 6 and value_data[4:6] == b"\x00\x01":
+                    raise ValueError(
+                        "PSBT unsigned tx must not use witness serialization"
+                    )
+                unsigned_tx = Transaction.from_raw(value_data)
+                unsigned_tx.has_segwit = False
+                unsigned_tx.witnesses = []
+            else:
+                unknown_global[key_data] = value_data
+
         if unsigned_tx is None:
-            # Create empty transaction
-            self.tx = Transaction([], [])
-        else:
-            # Ensure transaction has no scripts/witnesses (must be unsigned)
-            inputs = []
-            for tx_input in unsigned_tx.inputs:
-                # Create input without scriptSig
-                clean_input = TxInput(tx_input.txid, tx_input.txout_index)
-                inputs.append(clean_input)
+            raise ValueError("PSBT missing global unsigned transaction")
 
-            self.tx = Transaction(inputs, unsigned_tx.outputs[:], unsigned_tx.locktime, unsigned_tx.version)
+        # Verify the unsigned tx has no scriptSigs
+        for inp in unsigned_tx.inputs:
+            if inp.script_sig.script:
+                raise ValueError(
+                    "PSBT global unsigned tx must have empty scriptSigs"
+                )
 
-        # Initialize PSBT-specific data
-        self.inputs: List[PSBTInput] = [PSBTInput() for _ in self.tx.inputs]
-        self.outputs: List[PSBTOutput] = [PSBTOutput() for _ in self.tx.outputs]
+        # Build PSBT object (bypassing __init__ to avoid re-copying)
+        psbt = object.__new__(cls)
+        psbt.tx = unsigned_tx
+        psbt.unknown_global = unknown_global
+        psbt.inputs = []
+        psbt.outputs = []
 
-        # Global fields
-        self.version = self.VERSION
-        self.xpubs: Dict[bytes, Tuple[bytes, List[int]]] = {}  # xpub -> (fingerprint, path)
-        self.proprietary: Dict[bytes, bytes] = {}
-        self.unknown: Dict[bytes, bytes] = {}
+        # --- Input maps ---
+        for inp_idx in range(len(unsigned_tx.inputs)):
+            psi = PSBTInput()
+            seen_keys: set[bytes] = set()
+            while True:
+                kv = _read_kv_pair(stream)
+                if kv is None:
+                    break
+                key_data, value_data = kv
+                if key_data in seen_keys:
+                    raise ValueError(
+                        f"Duplicate key in input {inp_idx}"
+                    )
+                seen_keys.add(key_data)
+                key_type = key_data[0]
+                cls._parse_input_kv(psi, key_type, key_data, value_data)
+            psbt.inputs.append(psi)
 
-    @classmethod
-    def from_base64(cls, psbt_str: str) -> 'PSBT':
-        import base64
-        psbt_bytes = base64.b64decode(psbt_str)
-        return cls.from_bytes(psbt_bytes)
-
-    @classmethod
-    def from_bytes(cls, psbt_bytes: bytes) -> 'PSBT':
-        stream = BytesIO(psbt_bytes)
-
-        # Read and verify magic
-        magic = stream.read(4)
-        if magic != cls.MAGIC:
-            raise ValueError(f"Invalid PSBT magic: {magic.hex()}")
-
-        # Read separator
-        separator = stream.read(1)
-        if separator != b'\xff':
-            raise ValueError("Invalid PSBT separator")
-
-        # Parse global section
-        psbt = cls()
-        psbt._parse_global_section(stream)
-
-        # Parse input sections
-        for i in range(len(psbt.tx.inputs)):
-            psbt._parse_input_section(stream, i)
-
-        # Parse output sections
-        for i in range(len(psbt.tx.outputs)):
-            psbt._parse_output_section(stream, i)
+        # --- Output maps ---
+        for out_idx in range(len(unsigned_tx.outputs)):
+            pso = PSBTOutput()
+            seen_keys = set()
+            while True:
+                kv = _read_kv_pair(stream)
+                if kv is None:
+                    break
+                key_data, value_data = kv
+                if key_data in seen_keys:
+                    raise ValueError(
+                        f"Duplicate key in output {out_idx}"
+                    )
+                seen_keys.add(key_data)
+                key_type = key_data[0]
+                cls._parse_output_kv(pso, key_type, key_data, value_data)
+            psbt.outputs.append(pso)
 
         return psbt
 
-    def to_base64(self) -> str:
-        import base64
-        return base64.b64encode(self.to_bytes()).decode('ascii')
+    @staticmethod
+    def _parse_input_kv(
+        psi: PSBTInput, key_type: int, key_data: bytes, value_data: bytes
+    ):
+        # Validate key format for known types
+        if key_type in _KNOWN_INPUT_SINGLE_BYTE_KEYS:
+            if len(key_data) != 1:
+                raise ValueError(
+                    f"Input key type 0x{key_type:02x} must be a single byte, "
+                    f"got {len(key_data)} bytes"
+                )
+        if key_type in _KNOWN_INPUT_PUBKEY_KEYS:
+            _validate_pubkey_length(
+                key_data[1:], f"input key type 0x{key_type:02x}"
+            )
 
-    def to_bytes(self) -> bytes:
-        result = BytesIO()
+        if key_type == PSBT_IN_NON_WITNESS_UTXO and len(key_data) == 1:
+            psi.non_witness_utxo = Transaction.from_raw(value_data)
+        elif key_type == PSBT_IN_WITNESS_UTXO and len(key_data) == 1:
+            psi.witness_utxo = TxOutput.from_raw(value_data, 0)[0]
+        elif key_type == PSBT_IN_PARTIAL_SIG:
+            pubkey = key_data[1:]  # strip key type byte
+            psi.partial_sigs[pubkey] = value_data
+        elif key_type == PSBT_IN_SIGHASH_TYPE and len(key_data) == 1:
+            psi.sighash_type = struct.unpack("<I", value_data)[0]
+        elif key_type == PSBT_IN_REDEEM_SCRIPT and len(key_data) == 1:
+            psi.redeem_script = Script.from_raw(value_data)
+        elif key_type == PSBT_IN_WITNESS_SCRIPT and len(key_data) == 1:
+            psi.witness_script = Script.from_raw(value_data)
+        elif key_type == PSBT_IN_BIP32_DERIVATION:
+            pubkey = key_data[1:]
+            fingerprint = value_data[:4]
+            path = []
+            for i in range(4, len(value_data), 4):
+                path.append(struct.unpack("<I", value_data[i : i + 4])[0])
+            psi.bip32_derivs[pubkey] = (fingerprint, path)
+        elif key_type == PSBT_IN_FINAL_SCRIPTSIG and len(key_data) == 1:
+            psi.final_scriptsig = Script.from_raw(value_data)
+        elif key_type == PSBT_IN_FINAL_SCRIPTWITNESS and len(key_data) == 1:
+            wit_stream = BytesIO(value_data)
+            num_items = _read_compact_size_from_stream(wit_stream)
+            items = []
+            for _ in range(num_items):
+                item_len = _read_compact_size_from_stream(wit_stream)
+                items.append(wit_stream.read(item_len))
+            psi.final_scriptwitness = items
+        # BIP-371 Taproot fields
+        elif key_type == PSBT_IN_TAP_KEY_SIG and len(key_data) == 1:
+            if len(value_data) not in (64, 65):
+                raise ValueError("Invalid tap_key_sig length")
+            psi.tap_key_sig = value_data
+        elif key_type == PSBT_IN_TAP_SCRIPT_SIG:
+            if len(key_data) != 65:  # 1 byte type + 32 byte xonly + 32 byte leaf hash
+                raise ValueError("Invalid tap_script_sig key length")
+            pubkey = key_data[1:33]
+            leaf_hash = key_data[33:65]
+            if len(value_data) not in (64, 65):
+                raise ValueError("Invalid tap_script_sig value length")
+            psi.tap_script_sigs[(pubkey, leaf_hash)] = value_data
+        elif key_type == PSBT_IN_TAP_LEAF_SCRIPT:
+            if (len(key_data) - 1 - 33) % 32 != 0:
+                raise ValueError("Invalid tap_leaf_script control block size")
+            control_block = key_data[1:]
+            script = value_data[:-1]
+            leaf_ver = value_data[-1]
+            psi.tap_leaf_scripts[control_block] = (script, leaf_ver)
+        elif key_type == PSBT_IN_TAP_BIP32_DERIVATION:
+            if len(key_data) != 33:
+                raise ValueError("Invalid tap_bip32_derivation pubkey length")
+            pubkey = key_data[1:]
+            leaf_hashes = []
+            num_hashes = _read_compact_size_from_stream(BytesIO(value_data))
+            offset = len(encode_varint(num_hashes))
+            for _ in range(num_hashes):
+                leaf_hashes.append(value_data[offset:offset+32])
+                offset += 32
+            fingerprint = value_data[offset:offset+4]
+            path = []
+            for i in range(offset+4, len(value_data), 4):
+                path.append(struct.unpack("<I", value_data[i : i + 4])[0])
+            psi.tap_bip32_derivation[pubkey] = (leaf_hashes, fingerprint, path)
+        elif key_type == PSBT_IN_TAP_INTERNAL_KEY and len(key_data) == 1:
+            if len(value_data) != 32:
+                raise ValueError("Invalid tap_internal_key length")
+            psi.tap_internal_key = value_data
+        elif key_type == PSBT_IN_TAP_MERKLE_ROOT and len(key_data) == 1:
+            if len(value_data) != 32:
+                raise ValueError("Invalid tap_merkle_root length")
+            psi.tap_merkle_root = value_data
+        else:
+            psi.unknown[key_data] = value_data
 
-        # Write magic and separator
-        result.write(self.MAGIC)
-        result.write(b'\xff')
+    @staticmethod
+    def _parse_output_kv(
+        pso: PSBTOutput, key_type: int, key_data: bytes, value_data: bytes
+    ):
+        # Validate key format for known types
+        if key_type in _KNOWN_OUTPUT_SINGLE_BYTE_KEYS:
+            if len(key_data) != 1:
+                raise ValueError(
+                    f"Output key type 0x{key_type:02x} must be a single byte, "
+                    f"got {len(key_data)} bytes"
+                )
+        if key_type in _KNOWN_OUTPUT_PUBKEY_KEYS:
+            _validate_pubkey_length(
+                key_data[1:], f"output key type 0x{key_type:02x}"
+            )
 
-        # Write global section
-        self._serialize_global_section(result)
+        if key_type == PSBT_OUT_REDEEM_SCRIPT and len(key_data) == 1:
+            pso.redeem_script = Script.from_raw(value_data)
+        elif key_type == PSBT_OUT_WITNESS_SCRIPT and len(key_data) == 1:
+            pso.witness_script = Script.from_raw(value_data)
+        elif key_type == PSBT_OUT_BIP32_DERIVATION:
+            pubkey = key_data[1:]
+            fingerprint = value_data[:4]
+            path = []
+            for i in range(4, len(value_data), 4):
+                path.append(struct.unpack("<I", value_data[i : i + 4])[0])
+            pso.bip32_derivs[pubkey] = (fingerprint, path)
+        # BIP-371 Taproot fields
+        elif key_type == PSBT_OUT_TAP_INTERNAL_KEY and len(key_data) == 1:
+            if len(value_data) != 32:
+                raise ValueError("Invalid tap_internal_key length")
+            pso.tap_internal_key = value_data
+        elif key_type == PSBT_OUT_TAP_TREE and len(key_data) == 1:
+            pso.tap_tree = value_data
+        elif key_type == PSBT_OUT_TAP_BIP32_DERIVATION:
+            if len(key_data) != 33:
+                raise ValueError("Invalid tap_bip32_derivation pubkey length")
+            pubkey = key_data[1:]
+            leaf_hashes = []
+            num_hashes = _read_compact_size_from_stream(BytesIO(value_data))
+            offset = len(encode_varint(num_hashes))
+            for _ in range(num_hashes):
+                leaf_hashes.append(value_data[offset:offset+32])
+                offset += 32
+            fingerprint = value_data[offset:offset+4]
+            path = []
+            for i in range(offset+4, len(value_data), 4):
+                path.append(struct.unpack("<I", value_data[i : i + 4])[0])
+            pso.bip32_derivs[pubkey] = (fingerprint, path)
+        else:
+            pso.unknown[key_data] = value_data
 
-        # Write input sections
-        for i, psbt_input in enumerate(self.inputs):
-            self._serialize_input_section(result, i)
+    @classmethod
+    def from_base64(cls, b64_str: str) -> "PSBT":
+        """Deserialize a PSBT from a base64 string."""
+        return cls.from_bytes(base64.b64decode(b64_str))
 
-        # Write output sections
-        for i, psbt_output in enumerate(self.outputs):
-            self._serialize_output_section(result, i)
+    @classmethod
+    def from_hex(cls, hex_str: str) -> "PSBT":
+        """Deserialize a PSBT from a hex string."""
+        return cls.from_bytes(h_to_b(hex_str))
 
-        return result.getvalue()
+    # ------------------------------------------------------------------
+    # Updater
+    # ------------------------------------------------------------------
 
-    def add_input(self, tx_input: TxInput, psbt_input: Optional[PSBTInput] = None) -> None:
-        # Create clean input without scriptSig
-        clean_input = TxInput(tx_input.txid, tx_input.txout_index)
-        self.tx.inputs.append(clean_input)
+    def update_input(
+        self,
+        index: int,
+        non_witness_utxo: Optional[Transaction] = None,
+        witness_utxo: Optional[TxOutput] = None,
+        redeem_script: Optional[Script] = None,
+        witness_script: Optional[Script] = None,
+        sighash_type: Optional[int] = None,
+        bip32_derivs: Optional[dict[bytes, tuple[bytes, list[int]]]] = None,
+    ):
+        """Add UTXO and script metadata for an input."""
+        psi = self.inputs[index]
+        if non_witness_utxo is not None:
+            psi.non_witness_utxo = non_witness_utxo
+        if witness_utxo is not None:
+            psi.witness_utxo = witness_utxo
+        if redeem_script is not None:
+            psi.redeem_script = redeem_script
+        if witness_script is not None:
+            psi.witness_script = witness_script
+        if sighash_type is not None:
+            psi.sighash_type = sighash_type
+        if bip32_derivs is not None:
+            psi.bip32_derivs.update(bip32_derivs)
 
-        if psbt_input is None:
-            psbt_input = PSBTInput()
-        self.inputs.append(psbt_input)
+    def update_output(
+        self,
+        index: int,
+        redeem_script: Optional[Script] = None,
+        witness_script: Optional[Script] = None,
+        bip32_derivs: Optional[dict[bytes, tuple[bytes, list[int]]]] = None,
+    ):
+        """Add script metadata for an output."""
+        pso = self.outputs[index]
+        if redeem_script is not None:
+            pso.redeem_script = redeem_script
+        if witness_script is not None:
+            pso.witness_script = witness_script
+        if bip32_derivs is not None:
+            pso.bip32_derivs.update(bip32_derivs)
 
-    def add_output(self, tx_output: TxOutput, psbt_output: Optional[PSBTOutput] = None) -> None:
-        self.tx.outputs.append(tx_output)
+    # ------------------------------------------------------------------
+    # Signer
+    # ------------------------------------------------------------------
 
-        if psbt_output is None:
-            psbt_output = PSBTOutput()
-        self.outputs.append(psbt_output)
+    def sign_input(self, input_index: int, private_key, sighash: int = SIGHASH_ALL) -> bool:
+        """Sign a PSBT input using the library's signing methods.
 
-    def sign(self, private_key: PrivateKey, input_index: int, sighash_type: int = 1) -> bool:
-        return self.sign_input(input_index, private_key, sighash_type)
+        Parameters
+        ----------
+        input_index : int
+            Index of the input to sign.
+        private_key : PrivateKey
+            The private key to sign with.
+        sighash : int
+            Sighash type (default SIGHASH_ALL).
 
-    def sign_input(self, input_index: int, private_key: PrivateKey, sighash_type: int = 1) -> bool:
-        try:
-            psbt_input = self.inputs[input_index]
+        Returns
+        -------
+        bool
+            True if a signature was produced.
+        """
+        psi = self.inputs[input_index]
+        pubkey_hex = private_key.get_public_key().to_hex(compressed=True)
+        pubkey_bytes = h_to_b(pubkey_hex)
 
-            # Determine prev_txout and whether it is SegWit
-            prev_txout = psbt_input.witness_utxo
-            is_segwit = prev_txout is not None
+        # Determine the script type and sign accordingly
+        script_pubkey = self._get_script_pubkey(input_index)
+        if script_pubkey is None:
+            raise ValueError(
+                f"Cannot determine scriptPubKey for input {input_index}. "
+                "Provide non_witness_utxo or witness_utxo."
+            )
 
-            if not is_segwit:
-                prev_tx = psbt_input.non_witness_utxo
-                if prev_tx is None:
-                    print(f"Input {input_index} missing both witness_utxo and non_witness_utxo; cannot sign.")
-                    return False
-                prev_txout = prev_tx.outputs[self.tx.inputs[input_index].txout_index]
+        sig_hex = None
 
-            # --- P2TR (Taproot) key-path signing ---
-            if is_segwit and self._is_p2tr_script(prev_txout.script_pubkey):
-                from bitcoinutils.constants import TAPROOT_SIGHASH_ALL
-                # Collect all witness UTXOs for the Taproot sighash
-                utxos_for_signing = []
-                for i, inp in enumerate(self.inputs):
-                    if inp.witness_utxo is not None:
-                        utxos_for_signing.append(inp.witness_utxo)
-                    elif inp.non_witness_utxo is not None:
-                        utxos_for_signing.append(
-                            inp.non_witness_utxo.outputs[self.tx.inputs[i].txout_index]
-                        )
-                    else:
-                        raise ValueError(f"Input {i} missing UTXO for Taproot sighash")
+        if _is_p2pkh(script_pubkey):
+            sig_hex = private_key.sign_input(self.tx, input_index, script_pubkey, sighash)
 
-                # Map PSBT sighash_type to Taproot sighash
-                tap_sighash = sighash_type
-                if tap_sighash == 1:
-                    tap_sighash = 0  # SIGHASH_DEFAULT (== ALL for Taproot)
+        elif _is_p2wpkh(script_pubkey):
+            amount = self._get_witness_amount(input_index)
+            p2pkh_script = self._p2wpkh_to_p2pkh_script(script_pubkey)
+            sig_hex = private_key.sign_segwit_input(
+                self.tx, input_index, p2pkh_script, amount, sighash
+            )
 
-                sighash_bytes = self.tx.get_transaction_taproot_digest(
-                    input_index, utxos_for_signing, 0, tap_sighash
+        elif _is_p2sh(script_pubkey):
+            # Could be P2SH-P2WPKH, P2SH-P2WSH, or P2SH legacy
+            redeem = psi.redeem_script
+            if redeem is None:
+                raise ValueError(
+                    f"P2SH input {input_index} requires redeem_script"
+                )
+            if _is_p2wpkh(redeem):
+                # P2SH-P2WPKH
+                amount = self._get_witness_amount(input_index)
+                p2pkh_script = self._p2wpkh_to_p2pkh_script(redeem)
+                sig_hex = private_key.sign_segwit_input(
+                    self.tx, input_index, p2pkh_script, amount, sighash
+                )
+            elif _is_p2wsh(redeem):
+                # P2SH-P2WSH
+                ws = psi.witness_script
+                if ws is None:
+                    raise ValueError(
+                        f"P2SH-P2WSH input {input_index} requires witness_script"
+                    )
+                amount = self._get_witness_amount(input_index)
+                sig_hex = private_key.sign_segwit_input(
+                    self.tx, input_index, ws, amount, sighash
+                )
+            else:
+                # Legacy P2SH
+                sig_hex = private_key.sign_input(
+                    self.tx, input_index, redeem, sighash
                 )
 
-                # Schnorr signing
-                sig = private_key.sign_taproot_input(
-                    self.tx, input_index, utxos_for_signing, sighash_type=tap_sighash
+        elif _is_p2wsh(script_pubkey):
+            ws = psi.witness_script
+            if ws is None:
+                raise ValueError(
+                    f"P2WSH input {input_index} requires witness_script"
                 )
+            amount = self._get_witness_amount(input_index)
+            sig_hex = private_key.sign_segwit_input(
+                self.tx, input_index, ws, amount, sighash
+            )
 
-                # If non-default sighash, append the sighash byte
-                if tap_sighash != 0:
-                    psbt_input.tap_key_sig = bytes.fromhex(sig) + bytes([tap_sighash])
-                else:
-                    psbt_input.tap_key_sig = bytes.fromhex(sig)
-
+        elif _is_p2tr(script_pubkey):
+            amount = self._get_witness_amount(input_index)
+            # Default sighash is SIGHASH_DEFAULT (0)
+            if sighash == SIGHASH_ALL:
+                sighash = 0
+            
+            script_pubkeys = [self._get_script_pubkey(i) for i in range(len(self.inputs))]
+            amounts = [self._get_witness_amount(i) for i in range(len(self.inputs))]
+            
+            sig_hex = private_key.sign_taproot_input(
+                self.tx,
+                input_index,
+                script_pubkeys,
+                amounts,
+                ext_flag=0,
+                sighash=sighash
+            )
+            if sig_hex is not None:
+                # Schnorr sigs are 64 or 65 bytes (no length prefix unlike DER)
+                sig_bytes = h_to_b(sig_hex)
+                psi.tap_key_sig = sig_bytes
                 return True
 
-            # For P2WPKH, we need special handling
-            if is_segwit and self._is_p2wpkh_script(prev_txout.script_pubkey):
-                # Get the P2PKH script from the public key
-                pubkey_obj = private_key.get_public_key()
-                p2pkh_script = pubkey_obj.get_address().to_script_pub_key()
-                
-                sighash = self.tx.get_transaction_segwit_digest(
-                    input_index,
-                    p2pkh_script,  # This is the key fix!
-                    prev_txout.amount,
-                    sighash_type
-                )
-            else:
-                # Determine the correct script to use for other types
-                script_to_use = (
-                    psbt_input.witness_script
-                    if psbt_input.witness_script is not None
-                    else psbt_input.redeem_script
-                    if psbt_input.redeem_script is not None
-                    else prev_txout.script_pubkey
-                )
 
-                # Compute sighash
-                if is_segwit:
-                    sighash = self.tx.get_transaction_segwit_digest(
-                        input_index,
-                        script_to_use,
-                        prev_txout.amount,
-                        sighash_type
-                    )
-                else:
-                    sighash = self.tx.get_transaction_digest(
-                        input_index,
-                        script_to_use,
-                        sighash_type
-                    )
-
-            # Rest of your signing code remains the same...
-            if hasattr(private_key, 'key'):
-                raw_private_key = private_key.key.privkey.secret_multiplier.to_bytes(32, 'big')
-            else:
-                raw_private_key = private_key.to_bytes()
-
-            sk = SigningKey.from_string(raw_private_key, curve=SECP256k1)
-            sig = sk.sign_digest(sighash, sigencode=ecdsa.util.sigencode_der_canonize) + bytes([sighash_type])
-
-            pubkey_obj = private_key.get_public_key()
-            pubkey_hex = pubkey_obj.to_hex()
-            pubkey_bytes = bytes.fromhex(pubkey_hex)
-
-            if len(pubkey_bytes) != 33 or pubkey_bytes[0] not in [0x02, 0x03]:
-                raise ValueError(f"Invalid compressed public key: {pubkey_hex}")
-
-            psbt_input.partial_sigs[pubkey_bytes] = sig
-            return True
-
-        except Exception as e:
-            print(f"Error in sign_input: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def _get_signature_for_input(self, input_index: int, private_key: PrivateKey, sighash_type: int) -> bytes:
-        input_data = self.inputs[input_index]
-        tx_input = self.tx.inputs[input_index]
-
-        try:
-            # ✅ Ensure tx_input is proper TxInput object
-            if isinstance(tx_input, dict):
-                tx_input = TxInput(tx_input.get('txid'), tx_input.get('vout', tx_input.get('txout_index')))
-                self.tx.inputs[input_index] = tx_input
-
-            # ✅ Ensure witness_utxo is proper TxOutput object
-            if isinstance(input_data.witness_utxo, dict):
-                utxo_dict = input_data.witness_utxo
-                
-                # Handle script_pubkey conversion
-                spk = utxo_dict.get('script_pubkey')
-                if isinstance(spk, dict):
-                    spk = spk.get('hex') or spk.get('asm') or spk.get('script')
-                
-                # Handle different value field names
-                value = utxo_dict.get('value') or utxo_dict.get('amount')
-                
-                if spk and value is not None:
-                    input_data.witness_utxo = TxOutput(value, Script(spk))
-                else:
-                    return None
-
-            # ✅ Fix script_pubkey if it's still a dict inside TxOutput
-            elif isinstance(input_data.witness_utxo, TxOutput):
-                spk = input_data.witness_utxo.script_pubkey
-                if isinstance(spk, dict):
-                    spk_data = spk.get('hex') or spk.get('asm') or spk.get('script')
-                    if spk_data:
-                        input_data.witness_utxo.script_pubkey = Script(spk_data)
-                    else:
-                        return None
-
-            # ✅ Ensure scripts are proper Script objects
-            if input_data.redeem_script and isinstance(input_data.redeem_script, (str, bytes, dict)):
-                if isinstance(input_data.redeem_script, dict):
-                    script_data = input_data.redeem_script.get('hex') or input_data.redeem_script.get('asm')
-                else:
-                    script_data = input_data.redeem_script
-                input_data.redeem_script = Script(script_data)
-
-            if input_data.witness_script and isinstance(input_data.witness_script, (str, bytes, dict)):
-                if isinstance(input_data.witness_script, dict):
-                    script_data = input_data.witness_script.get('hex') or input_data.witness_script.get('asm')
-                else:
-                    script_data = input_data.witness_script
-                input_data.witness_script = Script(script_data)
-
-            # Now proceed with signing logic based on script type
-            if input_data.redeem_script:
-                redeem_script = input_data.redeem_script
-                
-                if input_data.witness_script:
-                    # P2SH-P2WSH (Script Hash wrapping Witness Script Hash)
-                    witness_script = input_data.witness_script
-                    if input_data.witness_utxo:
-                        amount = input_data.witness_utxo.amount
-                        print(f"Input Index: {input_index}")
-                        print(f"Witness Script: {witness_script.to_hex()}")
-                        print(f"Amount: {amount}")
-                        print(f"PubKey: {private_key.get_public_key().to_hex()}")
-
-                        return private_key.sign_segwit_input(
-                            self.tx, input_index, witness_script, amount, sighash_type
-                        )
-
-                elif self._is_p2wpkh_script(redeem_script):
-                    # P2SH-P2WPKH (Script Hash wrapping Witness PubKey Hash)
-                    if input_data.witness_utxo:
-                        amount = input_data.witness_utxo.amount
-                        print(f"Input Index: {input_index}")
-                        print(f"Amount: {amount}")
-
-                        # For P2WPKH, we need the P2PKH script of the public key
-                        p2pkh_script = private_key.get_public_key().get_address().to_script_pub_key()
-                        return private_key.sign_segwit_input(
-                            self.tx, input_index, p2pkh_script, amount, sighash_type
-                        )
-
-                else:
-                    # Regular P2SH (Script Hash)
-                    print(f"Input Index: {input_index}")
-                    print(f"Redeem Script: {redeem_script.to_hex()}")
-                    
-                    return private_key.sign_input(
-                        self.tx, input_index, redeem_script, sighash_type
-                    )
-
-            elif input_data.witness_script:
-                # P2WSH (Witness Script Hash)
-                witness_script = input_data.witness_script
-                if input_data.witness_utxo:
-                    amount = input_data.witness_utxo.amount
-                    print(f"Input Index: {input_index}")
-                    print(f"Witness Script: {witness_script.to_hex()}")
-                    print(f"Amount: {amount}")
-
-                    return private_key.sign_segwit_input(
-                        self.tx, input_index, witness_script, amount, sighash_type
-                    )
-
-            elif input_data.witness_utxo:
-                # Direct witness input (P2WPKH or P2TR)
-                script_pubkey = input_data.witness_utxo.script_pubkey
-                amount = input_data.witness_utxo.amount
-
-                if self._is_p2wpkh_script(script_pubkey):
-                    # P2WPKH (Witness PubKey Hash)
-                    print(f"Input Index: {input_index}")
-                    print(f"Amount: {amount}")
-                    
-                    # For P2WPKH, we sign with the P2PKH script of our public key
-                    p2pkh_script = private_key.get_public_key().get_address().to_script_pub_key()
-                    return private_key.sign_segwit_input(
-                        self.tx, input_index, p2pkh_script, amount, sighash_type
-                    )
-
-                elif self._is_p2tr_script(script_pubkey):
-                    # P2TR (Taproot)
-                    print(f"Input Index: {input_index}")
-                    print(f"Amount: {amount}")
-                    
-                    return private_key.sign_taproot_input(
-                        self.tx, input_index, amount, sighash_type
-                    )
-
-            elif input_data.non_witness_utxo:
-                # Legacy input (P2PKH, P2SH without witness)
-                prev_tx_out = input_data.non_witness_utxo.outputs[tx_input.txout_index]
-                script_pubkey = prev_tx_out.script_pubkey
-
-                if self._is_p2pkh_script(script_pubkey):
-                    # P2PKH (Pay to PubKey Hash)
-                    print(f"Input Index: {input_index}")
-                    print(f"Script PubKey: {script_pubkey.to_hex()}")
-                    
-                    return private_key.sign_input(
-                        self.tx, input_index, script_pubkey, sighash_type
-                    )
-
-            print(f"⚠️ No suitable script type matched for input {input_index}")
-            
-            # Debug information
-            print(f"Debug info:")
-            print(f"  - Has redeem_script: {bool(input_data.redeem_script)}")
-            print(f"  - Has witness_script: {bool(input_data.witness_script)}")
-            print(f"  - Has witness_utxo: {bool(input_data.witness_utxo)}")
-            print(f"  - Has non_witness_utxo: {bool(input_data.non_witness_utxo)}")
-            
-            if input_data.witness_utxo:
-                spk = input_data.witness_utxo.script_pubkey
-                print(f"  - Script pubkey type checks:")
-                print(f"    - is_p2wpkh: {self._is_p2wpkh_script(spk)}")
-                print(f"    - is_p2tr: {self._is_p2tr_script(spk)}")
-                print(f"    - Script hex: {spk.to_hex() if hasattr(spk, 'to_hex') else 'N/A'}")
-            
-            return None
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return None
-
-
-    def _is_p2pkh_script(self, script) -> bool:
-        """Check if script is P2PKH (OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG)."""
-        try:
-            return script.is_p2pkh() if hasattr(script, 'is_p2pkh') else False
-        except:
-            return False
-
-    def _is_p2wpkh_script(self, script) -> bool:
-        """Check if script is P2WPKH (OP_0 <20-byte-pubkeyhash>)."""
-        try:
-            return script.is_p2wpkh() if hasattr(script, 'is_p2wpkh') else False
-        except:
-            return False
-
-    def _is_p2tr_script(self, script_pubkey: Script) -> bool:
-        """Check if script is P2TR (Taproot)."""
-        if not hasattr(script_pubkey, 'script'):
-            return False
-        
-        script_ops = script_pubkey.script
-        # P2TR is OP_1 followed by 32 bytes
-        return (len(script_ops) == 2 and 
-                script_ops[0] == 1 and  # OP_1 
-                isinstance(script_ops[1], bytes) and 
-                len(script_ops[1]) == 32)
-
-    def _is_input_finalized(self, psbt_input: PSBTInput) -> bool:
-        """Check if an input is already finalized."""
-        return (psbt_input.final_scriptsig is not None or 
-                psbt_input.final_scriptwitness is not None)
-
-    def _apply_final_fields(self, tx_input: TxInput, input_data: PSBTInput) -> None:
-        if input_data.final_scriptsig:
-            tx_input.script_sig = input_data.final_scriptsig
         else:
-            tx_input.script_sig = Script([])
-
-    def _validate_final_tx(self, final_tx) -> dict:
-        """Validate the finalized transaction."""
-        validation_info = {
-            'valid': True,
-            'errors': [],
-            'warnings': []
-        }
-        
-        # Basic validation
-        if not final_tx.inputs:
-            validation_info['valid'] = False
-            validation_info['errors'].append("Transaction has no inputs")
-        
-        if not final_tx.outputs:
-            validation_info['valid'] = False
-            validation_info['errors'].append("Transaction has no outputs")
-        
-        # Check that all inputs have scriptSig or witness
-        for i, tx_input in enumerate(final_tx.inputs):
-            has_scriptsig = tx_input.script_sig and len(tx_input.script_sig.script) > 0
-            has_witness = (hasattr(final_tx, 'witnesses') and 
-                        i < len(final_tx.witnesses) and 
-                        final_tx.witnesses[i] and 
-                        len(final_tx.witnesses[i]) > 0)
-            
-            if not has_scriptsig and not has_witness:
-                validation_info['valid'] = False
-                validation_info['errors'].append(f"Input {i} has no scriptSig or witness")
-        
-        # Calculate transaction size and vsize
-        try:
-            tx_bytes = final_tx.serialize()
-            if isinstance(tx_bytes, str):
-                tx_bytes = bytes.fromhex(tx_bytes)
-            
-            validation_info['size'] = len(tx_bytes)
-            
-            # Calculate vsize (virtual size) for SegWit transactions
-            # For non-SegWit transactions, vsize = size
-            # For SegWit transactions, vsize = (base_size * 3 + total_size) / 4
-            has_witnesses = (hasattr(final_tx, 'witnesses') and 
-                            any(witness for witness in final_tx.witnesses))
-            
-            if has_witnesses:
-                # Calculate base size (transaction without witness data)
-                base_tx_data = self._serialize_transaction_without_witness(final_tx)
-                base_size = len(base_tx_data)
-                total_size = len(tx_bytes)
-                validation_info['vsize'] = (base_size * 3 + total_size) // 4
-            else:
-                validation_info['vsize'] = len(tx_bytes)
-                
-        except Exception as e:
-            validation_info['size'] = 0
-            validation_info['vsize'] = 0
-            validation_info['warnings'].append(f"Could not calculate transaction size: {str(e)}")
-        
-        return validation_info
-
-    def _serialize_transaction_without_witness(self, tx) -> bytes:
-        """Serialize transaction without witness data for vsize calculation."""
-        try:
-            # Create a copy of the transaction without witness data
-            from bitcoinutils.transactions import Transaction
-            from bitcoinutils.script import Script
-            
-            # Create inputs without witness data
-            inputs_without_witness = []
-            for tx_input in tx.inputs:
-                clean_input = type(tx_input)(
-                    tx_input.txid,
-                    tx_input.txout_index,
-                    tx_input.script_sig if tx_input.script_sig else Script([]),
-                    tx_input.sequence if hasattr(tx_input, 'sequence') else 0xffffffff
-                )
-                inputs_without_witness.append(clean_input)
-            
-            # Create transaction without witness
-            base_tx = Transaction(
-                inputs_without_witness,
-                tx.outputs,
-                tx.locktime if hasattr(tx, 'locktime') else 0,
-                tx.version if hasattr(tx, 'version') else 1
+            raise ValueError(
+                f"Unsupported script type for input {input_index}"
             )
-            
-            # Serialize without witness
-            serialized = base_tx.serialize()
-            if isinstance(serialized, str):
-                return bytes.fromhex(serialized)
-            return serialized
-            
-        except Exception:
-            # Fallback: assume no witness data
-            serialized = tx.serialize()
-            if isinstance(serialized, str):
-                return bytes.fromhex(serialized)
-            return serialized
 
-    def combine(self, other: 'PSBT') -> 'PSBT':
-        # Ensure both PSBTs have the same unsigned transaction
-        if self.tx.serialize() != other.tx.serialize():
-            raise ValueError("Cannot combine PSBTs with different transactions")
-        
-        # Create new PSBT with combined data
+        if sig_hex is not None:
+            psi.partial_sigs[pubkey_bytes] = h_to_b(sig_hex)
+            return True
+        return False
+
+    def _get_script_pubkey(self, input_index: int) -> Optional[Script]:
+        """Get the scriptPubKey for the given input from UTXO data."""
+        psi = self.inputs[input_index]
+        if psi.witness_utxo is not None:
+            return psi.witness_utxo.script_pubkey
+        if psi.non_witness_utxo is not None:
+            txin = self.tx.inputs[input_index]
+            prev_tx = psi.non_witness_utxo
+            return prev_tx.outputs[txin.txout_index].script_pubkey
+        return None
+
+    def _get_witness_amount(self, input_index: int) -> int:
+        """Get the amount for segwit signing."""
+        psi = self.inputs[input_index]
+        if psi.witness_utxo is not None:
+            return psi.witness_utxo.amount
+        if psi.non_witness_utxo is not None:
+            txin = self.tx.inputs[input_index]
+            return psi.non_witness_utxo.outputs[txin.txout_index].amount
+        raise ValueError(f"No UTXO data for input {input_index}")
+
+    @staticmethod
+    def _p2wpkh_to_p2pkh_script(wpkh_script: Script) -> Script:
+        """Convert a P2WPKH scriptPubKey to P2PKH-equivalent for segwit signing."""
+        keyhash = wpkh_script.script[1]
+        return Script(["OP_DUP", "OP_HASH160", keyhash, "OP_EQUALVERIFY", "OP_CHECKSIG"])
+
+    # ------------------------------------------------------------------
+    # Combiner
+    # ------------------------------------------------------------------
+
+    def combine(self, other: "PSBT") -> "PSBT":
+        """Combine this PSBT with another, returning a new merged PSBT.
+
+        Both PSBTs must have the same unsigned transaction.
+        """
+        if self.tx.to_bytes(False) != other.tx.to_bytes(False):
+            raise ValueError("Cannot combine PSBTs with different unsigned transactions")
+
         combined = PSBT(self.tx)
-        
-        # Combine global data
-        combined.xpubs.update(self.xpubs)
-        combined.xpubs.update(other.xpubs)
-        combined.proprietary.update(self.proprietary)
-        combined.proprietary.update(other.proprietary)
-        combined.unknown.update(self.unknown)
-        combined.unknown.update(other.unknown)
-        
-        # Combine input data
-        for i, (input1, input2) in enumerate(zip(self.inputs, other.inputs)):
-            combined_input = combined.inputs[i]
-            
-            # Combine UTXOs (prefer witness_utxo)
-            if input1.witness_utxo:
-                combined_input.witness_utxo = input1.witness_utxo
-            elif input2.witness_utxo:
-                combined_input.witness_utxo = input2.witness_utxo
-            elif input1.non_witness_utxo:
-                combined_input.non_witness_utxo = input1.non_witness_utxo
-            elif input2.non_witness_utxo:
-                combined_input.non_witness_utxo = input2.non_witness_utxo
-            
-            # Combine partial signatures
-            combined_input.partial_sigs.update(input1.partial_sigs)
-            combined_input.partial_sigs.update(input2.partial_sigs)
-            
-            # Combine other fields
-            combined_input.sighash_type = input1.sighash_type or input2.sighash_type
-            combined_input.redeem_script = input1.redeem_script or input2.redeem_script
-            combined_input.witness_script = input1.witness_script or input2.witness_script
-            combined_input.bip32_derivs.update(input1.bip32_derivs)
-            combined_input.bip32_derivs.update(input2.bip32_derivs)
-            
-            # Final scripts (should be same or one empty)
-            combined_input.final_scriptsig = input1.final_scriptsig or input2.final_scriptsig
-            if input1.final_scriptwitness:
-                combined_input.final_scriptwitness = input1.final_scriptwitness
-            elif input2.final_scriptwitness:
-                combined_input.final_scriptwitness = input2.final_scriptwitness
-            
-            # Combine preimages and proprietary data
-            combined_input.ripemd160_preimages.update(input1.ripemd160_preimages)
-            combined_input.ripemd160_preimages.update(input2.ripemd160_preimages)
-            combined_input.sha256_preimages.update(input1.sha256_preimages)
-            combined_input.sha256_preimages.update(input2.sha256_preimages)
-            combined_input.hash160_preimages.update(input1.hash160_preimages)
-            combined_input.hash160_preimages.update(input2.hash160_preimages)
-            combined_input.hash256_preimages.update(input1.hash256_preimages)
-            combined_input.hash256_preimages.update(input2.hash256_preimages)
-            combined_input.proprietary.update(input1.proprietary)
-            combined_input.proprietary.update(input2.proprietary)
-            combined_input.unknown.update(input1.unknown)
-            combined_input.unknown.update(input2.unknown)
-        
-        # Combine output data
-        for i, (output1, output2) in enumerate(zip(self.outputs, other.outputs)):
-            combined_output = combined.outputs[i]
-            combined_output.redeem_script = output1.redeem_script or output2.redeem_script
-            combined_output.witness_script = output1.witness_script or output2.witness_script
-            combined_output.bip32_derivs.update(output1.bip32_derivs)
-            combined_output.bip32_derivs.update(output2.bip32_derivs)
-            combined_output.proprietary.update(output1.proprietary)
-            combined_output.proprietary.update(output2.proprietary)
-            combined_output.unknown.update(output1.unknown)
-            combined_output.unknown.update(output2.unknown)
-        
-        return combined
+        combined.unknown_global = {**self.unknown_global, **other.unknown_global}
 
-    def combine_psbts(self, other_psbts: List['PSBT']) -> 'PSBT':
-        combined = self
-        for other in other_psbts:
-            combined = combined.combine(other)
-        return combined
-
-    def finalize(self, validate: bool = False) -> Union[Transaction, Tuple[Transaction, Dict], bool]:
-        # Count successfully finalized inputs
-        finalized_count = 0
         for i in range(len(self.inputs)):
-            if self._finalize_input(i):
-                finalized_count += 1
+            dst = combined.inputs[i]
+            for src in (self.inputs[i], other.inputs[i]):
+                if src.non_witness_utxo is not None:
+                    dst.non_witness_utxo = src.non_witness_utxo
+                if src.witness_utxo is not None:
+                    dst.witness_utxo = src.witness_utxo
+                dst.partial_sigs.update(src.partial_sigs)
+                if src.sighash_type is not None:
+                    dst.sighash_type = src.sighash_type
+                if src.redeem_script is not None:
+                    dst.redeem_script = src.redeem_script
+                if src.witness_script is not None:
+                    dst.witness_script = src.witness_script
+                dst.bip32_derivs.update(src.bip32_derivs)
+                if src.final_scriptsig is not None:
+                    dst.final_scriptsig = src.final_scriptsig
+                if src.final_scriptwitness is not None:
+                    dst.final_scriptwitness = src.final_scriptwitness
+                
+                # Taproot combine
+                if src.tap_key_sig is not None:
+                    dst.tap_key_sig = src.tap_key_sig
+                dst.tap_script_sigs.update(src.tap_script_sigs)
+                dst.tap_leaf_scripts.update(src.tap_leaf_scripts)
+                dst.tap_bip32_derivation.update(src.tap_bip32_derivation)
+                if src.tap_internal_key is not None:
+                    dst.tap_internal_key = src.tap_internal_key
+                if src.tap_merkle_root is not None:
+                    dst.tap_merkle_root = src.tap_merkle_root
 
-        # If not all inputs could be finalized, return False
-        if finalized_count != len(self.inputs):
-            if validate:
-                # Return a validation dict with error info
-                validation_info = {
-                    'valid': False,
-                    'errors': [f"Could not finalize all inputs. Finalized: {finalized_count}/{len(self.inputs)}"],
-                    'warnings': []
-                }
-                # Return a dummy transaction and validation info
-                return self.tx, validation_info
+                dst.unknown.update(src.unknown)
+
+        for i in range(len(self.outputs)):
+            dst = combined.outputs[i]
+            for src in (self.outputs[i], other.outputs[i]):
+                if src.redeem_script is not None:
+                    dst.redeem_script = src.redeem_script
+                if src.witness_script is not None:
+                    dst.witness_script = src.witness_script
+                dst.bip32_derivs.update(src.bip32_derivs)
+                
+                # Taproot combine
+                if src.tap_internal_key is not None:
+                    dst.tap_internal_key = src.tap_internal_key
+                if src.tap_tree is not None:
+                    dst.tap_tree = src.tap_tree
+                dst.tap_bip32_derivation.update(src.tap_bip32_derivation)
+
+                dst.unknown.update(src.unknown)
+
+        return combined
+
+    # ------------------------------------------------------------------
+    # Finalizer
+    # ------------------------------------------------------------------
+
+    def finalize_input(self, input_index: int):
+        """Finalize a single input, constructing final scriptSig / witness."""
+        psi = self.inputs[input_index]
+
+        # Already finalized?
+        if psi.final_scriptsig is not None or psi.final_scriptwitness is not None:
+            return
+
+        script_pubkey = self._get_script_pubkey(input_index)
+        if script_pubkey is None:
+            raise ValueError(f"Cannot determine script type for input {input_index}")
+
+        if _is_p2pkh(script_pubkey):
+            self._finalize_p2pkh(psi)
+        elif _is_p2wpkh(script_pubkey):
+            self._finalize_p2wpkh(psi)
+        elif _is_p2sh(script_pubkey):
+            redeem = psi.redeem_script
+            if redeem is None:
+                raise ValueError("P2SH input requires redeem_script for finalization")
+            if _is_p2wpkh(redeem):
+                self._finalize_p2sh_p2wpkh(psi)
+            elif _is_p2wsh(redeem):
+                self._finalize_p2sh_p2wsh(psi)
             else:
-                return False
+                self._finalize_p2sh_legacy(psi)
+        elif _is_p2wsh(script_pubkey):
+            self._finalize_p2wsh(psi)
+        elif _is_p2tr(script_pubkey):
+            self._finalize_p2tr(psi)
+        else:
+            raise ValueError("Unsupported script type for finalization")
 
-        # All inputs finalized - build final transaction
-        final_inputs = []
-        for i, (tx_input, psbt_input) in enumerate(zip(self.tx.inputs, self.inputs)):
-            final_input = TxInput(
-                tx_input.txid,
-                tx_input.txout_index,
-                psbt_input.final_scriptsig or Script([]),
-                tx_input.sequence
-            )
-            final_inputs.append(final_input)
+        # Clear non-final fields after finalization
+        psi.partial_sigs = {}
+        psi.sighash_type = None
+        psi.redeem_script = None
+        psi.witness_script = None
+        psi.bip32_derivs = {}
+        psi.tap_key_sig = None
+        psi.tap_script_sigs = {}
+        psi.tap_leaf_scripts = {}
+        psi.tap_bip32_derivation = {}
+        psi.tap_internal_key = None
+        psi.tap_merkle_root = None
 
-        final_tx = Transaction(
-            final_inputs,
-            self.tx.outputs[:],
-            self.tx.locktime,
-            self.tx.version
+    def finalize(self):
+        """Finalize all inputs."""
+        for i in range(len(self.inputs)):
+            self.finalize_input(i)
+
+    @staticmethod
+    def _finalize_p2pkh(psi: PSBTInput):
+        if len(psi.partial_sigs) != 1:
+            raise ValueError("P2PKH finalization requires exactly one signature")
+        pubkey, sig = next(iter(psi.partial_sigs.items()))
+        psi.final_scriptsig = Script([b_to_h(sig), b_to_h(pubkey)])
+
+    @staticmethod
+    def _finalize_p2wpkh(psi: PSBTInput):
+        if len(psi.partial_sigs) != 1:
+            raise ValueError("P2WPKH finalization requires exactly one signature")
+        pubkey, sig = next(iter(psi.partial_sigs.items()))
+        psi.final_scriptsig = Script([])
+        psi.final_scriptwitness = [sig, pubkey]
+
+    @staticmethod
+    def _finalize_p2sh_p2wpkh(psi: PSBTInput):
+        if len(psi.partial_sigs) != 1:
+            raise ValueError("P2SH-P2WPKH finalization requires exactly one signature")
+        pubkey, sig = next(iter(psi.partial_sigs.items()))
+        psi.final_scriptsig = Script([psi.redeem_script.to_hex()])
+        psi.final_scriptwitness = [sig, pubkey]
+
+    @staticmethod
+    def _finalize_p2tr(psi: PSBTInput):
+        if psi.tap_key_sig is not None:
+            # Key path spend
+            psi.final_scriptsig = Script([])
+            psi.final_scriptwitness = [psi.tap_key_sig]
+        else:
+            raise ValueError("Taproot script path finalization not yet fully supported by PSBT")
+
+    @staticmethod
+    def _finalize_p2wsh(psi: PSBTInput):
+        ws = psi.witness_script
+        if ws is None:
+            raise ValueError("P2WSH finalization requires witness_script")
+        ms = _parse_multisig(ws)
+        if ms is None:
+            raise ValueError("P2WSH finalization currently only supports multisig")
+        m, n, script_pubkeys = ms
+        ordered_sigs = _order_sigs_for_multisig(psi.partial_sigs, script_pubkeys, m)
+        psi.final_scriptsig = Script([])
+        psi.final_scriptwitness = [b""] + ordered_sigs + [ws.to_bytes()]
+
+    @staticmethod
+    def _finalize_p2sh_p2wsh(psi: PSBTInput):
+        ws = psi.witness_script
+        if ws is None:
+            raise ValueError("P2SH-P2WSH finalization requires witness_script")
+        ms = _parse_multisig(ws)
+        if ms is None:
+            raise ValueError("P2SH-P2WSH finalization currently only supports multisig")
+        m, n, script_pubkeys = ms
+        ordered_sigs = _order_sigs_for_multisig(psi.partial_sigs, script_pubkeys, m)
+        psi.final_scriptsig = Script([psi.redeem_script.to_hex()])
+        psi.final_scriptwitness = [b""] + ordered_sigs + [ws.to_bytes()]
+
+    @staticmethod
+    def _finalize_p2sh_legacy(psi: PSBTInput):
+        rs = psi.redeem_script
+        if rs is None:
+            raise ValueError("P2SH finalization requires redeem_script")
+        ms = _parse_multisig(rs)
+        if ms is not None:
+            m, n, script_pubkeys = ms
+            ordered_sigs = _order_sigs_for_multisig(psi.partial_sigs, script_pubkeys, m)
+            sig_hexes = [b_to_h(s) for s in ordered_sigs]
+            psi.final_scriptsig = Script(["OP_0"] + sig_hexes + [rs.to_hex()])
+        elif len(psi.partial_sigs) == 1:
+            pubkey, sig = next(iter(psi.partial_sigs.items()))
+            psi.final_scriptsig = Script([b_to_h(sig), b_to_h(pubkey), rs.to_hex()])
+        else:
+            raise ValueError("Cannot finalize P2SH input: unsupported script pattern")
+
+    # ------------------------------------------------------------------
+    # Extractor
+    # ------------------------------------------------------------------
+
+    def extract_transaction(self) -> Transaction:
+        """Extract the fully signed transaction.
+
+        Returns
+        -------
+        Transaction
+            The complete, signed transaction ready for broadcast.
+        """
+        has_witness = False
+        for psi in self.inputs:
+            if psi.final_scriptsig is None and psi.final_scriptwitness is None:
+                raise ValueError(
+                    "Cannot extract: not all inputs are finalized"
+                )
+            if psi.final_scriptwitness is not None:
+                has_witness = True
+
+        inputs = []
+        for i, txin in enumerate(self.tx.inputs):
+            new_in = TxInput(txin.txid, txin.txout_index, sequence=txin.sequence)
+            psi = self.inputs[i]
+            if psi.final_scriptsig is not None:
+                new_in.script_sig = psi.final_scriptsig
+            inputs.append(new_in)
+
+        outputs = [TxOutput(txout.amount, txout.script_pubkey) for txout in self.tx.outputs]
+
+        witnesses = []
+        if has_witness:
+            for i in range(len(inputs)):
+                psi = self.inputs[i]
+                if psi.final_scriptwitness is not None:
+                    stack = [b_to_h(item) for item in psi.final_scriptwitness]
+                    witnesses.append(TxWitnessInput(stack))
+                else:
+                    witnesses.append(TxWitnessInput([]))
+
+        return Transaction(
+            inputs=inputs,
+            outputs=outputs,
+            locktime=self.tx.locktime,
+            version=self.tx.version,
+            has_segwit=has_witness,
+            witnesses=witnesses,
         )
 
-        # Add witness data
-        final_tx.witnesses = []
-        for psbt_input in self.inputs:
-            if psbt_input.final_scriptwitness:
-                final_tx.witnesses.append(psbt_input.final_scriptwitness)
-            else:
-                final_tx.witnesses.append([])
 
-        if validate:
-            validation_info = self._validate_final_tx(final_tx)
-            # Add txid to validation info
-            try:
-                validation_info['txid'] = final_tx.get_txid()
-            except:
-                validation_info['txid'] = 'Unable to compute'
-            
-            return final_tx, validation_info
-        else:
-            return final_tx
+def _order_sigs_for_multisig(
+    partial_sigs: dict[bytes, bytes],
+    script_pubkeys: list[str],
+    m: int,
+) -> list[bytes]:
+    """Order partial signatures to match the pubkey order in a multisig script.
 
-    def finalize_input(self, input_index: int) -> bool:
-        
-        if input_index >= len(self.inputs):
-            raise ValueError(f"Input index {input_index} out of range")
-
-        return self._finalize_input(input_index)
-
-    def _finalize_input(self, input_index: int) -> bool:
-       
-        psbt_input = self.inputs[input_index]
-
-        # Skip if already finalized
-        if self._is_input_finalized(psbt_input):
-            return True
-
-        # Get UTXO info
-        if psbt_input.witness_utxo:
-            prev_output = psbt_input.witness_utxo
-            script_pubkey = prev_output.script_pubkey
-        elif psbt_input.non_witness_utxo:
-            prev_vout = self.tx.inputs[input_index].txout_index
-            prev_output = psbt_input.non_witness_utxo.outputs[prev_vout]
-            script_pubkey = prev_output.script_pubkey
-        else:
-            return False
-
-        # Handle P2TR first (uses tap_key_sig, not partial_sigs)
-        if self._is_p2tr_script(script_pubkey):
-            return self._finalize_p2tr(psbt_input)
-
-        # Need partial signatures to finalize non-Taproot inputs
-        if not psbt_input.partial_sigs:
-            return False
-
-        # Handle different script types with improved detection
-        try:
-            if script_pubkey.is_p2pkh():
-                return self._finalize_p2pkh(psbt_input)
-            elif script_pubkey.is_p2wpkh():
-                return self._finalize_p2wpkh(psbt_input)
-            elif script_pubkey.is_p2sh():
-                return self._finalize_p2sh(psbt_input)
-            elif script_pubkey.is_p2wsh():
-                return self._finalize_p2wsh(psbt_input)
-        except Exception:
-            pass
-
-        return False
-
-    def _finalize_p2pkh(self, psbt_input: PSBTInput) -> bool:
-        """Finalize P2PKH input."""
-        if len(psbt_input.partial_sigs) != 1:
-            return False
-
-        pubkey, signature = next(iter(psbt_input.partial_sigs.items()))
-        psbt_input.final_scriptsig = Script([signature, pubkey])
-        return True
-
-    def _finalize_p2wpkh(self, psbt_input: PSBTInput) -> bool:
-        """Finalize P2WPKH input."""
-        if len(psbt_input.partial_sigs) != 1:
-            return False
-
-        pubkey, signature = next(iter(psbt_input.partial_sigs.items()))
-        psbt_input.final_scriptsig = Script([])
-        psbt_input.final_scriptwitness = [signature, pubkey]
-        return True
-
-    def _finalize_p2sh(self, psbt_input: PSBTInput) -> bool:
-        """Finalize P2SH input with support for nested SegWit."""
-        if not psbt_input.redeem_script:
-            return False
-
-        redeem_script = psbt_input.redeem_script
-
-        # Handle P2SH-wrapped SegWit
-        if redeem_script.is_p2wpkh():
-            return self._finalize_p2sh_p2wpkh(psbt_input)
-        elif redeem_script.is_p2wsh():
-            return self._finalize_p2sh_p2wsh(psbt_input)
-        else:
-            # Regular P2SH - finalize the redeem script
-            success = self._finalize_script(psbt_input, redeem_script, is_witness=False)
-            if success:
-                # For regular P2SH, the scriptSig should already contain the unlocking script
-                # plus the redeem script. The _finalize_script method handles adding the redeem script.
-                pass
-            return success
-
-    def _finalize_p2sh_p2wpkh(self, psbt_input: PSBTInput) -> bool:
-        """Finalize P2SH-wrapped P2WPKH input."""
-        if len(psbt_input.partial_sigs) != 1:
-            return False
-
-        pubkey, signature = next(iter(psbt_input.partial_sigs.items()))
-
-        # scriptSig contains just the redeem script
-        redeem_script_bytes = self._safe_to_bytes(psbt_input.redeem_script)
-        psbt_input.final_scriptsig = Script([redeem_script_bytes])
-
-        # Safe bytes conversion
-        sig_bytes = signature if isinstance(signature, bytes) else signature
-        pubkey_bytes = pubkey if isinstance(pubkey, bytes) else pubkey
-        psbt_input.final_scriptwitness = [sig_bytes, pubkey_bytes]
-        return True
-
-    def _finalize_p2sh_p2wsh(self, psbt_input: PSBTInput) -> bool:
-        """Finalize P2SH-wrapped P2WSH input."""
-        if not psbt_input.witness_script:
-            return False
-
-        # Finalize the witness script part
-        success = self._finalize_script(psbt_input, psbt_input.witness_script, is_witness=True)
-        if success:
-            # For P2SH-P2WSH, scriptSig contains only the redeem script (P2WSH script)
-            redeem_bytes = self._safe_to_bytes(psbt_input.redeem_script)
-            psbt_input.final_scriptsig = Script([redeem_bytes])
-            
-            # The witness script is already added by _finalize_script
-            # No need to append it again
-        return success
-
-    def _finalize_p2wsh(self, psbt_input: PSBTInput) -> bool:
-        """Finalize P2WSH input."""
-        if not psbt_input.witness_script:
-            return False
-
-        witness_script = psbt_input.witness_script
-        script_ops = witness_script.script
-
-        # Check if it's a multisig script
-        if (len(script_ops) >= 4 and 
-            script_ops[0] in ['OP_1', 'OP_2', 'OP_3'] and
-            script_ops[-1] == 'OP_CHECKMULTISIG'):
-            
-            # Extract m value
-            if script_ops[0] == 'OP_1':
-                m = 1
-            elif script_ops[0] == 'OP_2':
-                m = 2
-            elif script_ops[0] == 'OP_3':
-                m = 3
-            else:
-                return False
-            
-            # Extract pubkeys from the script
-            pubkeys_in_script = []
-            for i in range(1, len(script_ops) - 2):
-                op = script_ops[i]
-                if isinstance(op, str) and not op.startswith('OP_'):
-                    pubkeys_in_script.append(op)
-            
-            # Match signatures to pubkeys in script order
-            ordered_sigs = []
-            for script_pubkey in pubkeys_in_script:
-                for partial_pubkey, sig in psbt_input.partial_sigs.items():
-                    # Convert to hex for comparison
-                    partial_pubkey_hex = partial_pubkey.hex() if isinstance(partial_pubkey, bytes) else partial_pubkey
-                    
-                    # Compare the compressed pubkey (33 bytes = 66 hex chars)
-                    if partial_pubkey_hex[:66] == script_pubkey:
-                        ordered_sigs.append(sig)
-                        break
-            
-            if len(ordered_sigs) < m:
-                return False
-            
-            # Build witness stack: [OP_0, sig1, sig2, ..., sigM, witness_script]
-            psbt_input.final_scriptsig = Script([])
-            psbt_input.final_scriptwitness = []
-            
-            # Add OP_0 (empty element) - required for CHECKMULTISIG bug
-            psbt_input.final_scriptwitness.append(b'')
-            
-            # Add the first m signatures in correct order
-            for sig in ordered_sigs[:m]:
-                if isinstance(sig, bytes):
-                    psbt_input.final_scriptwitness.append(sig)
-                else:
-                    psbt_input.final_scriptwitness.append(bytes.fromhex(sig))
-            
-            # Add the witness script as bytes
-            psbt_input.final_scriptwitness.append(witness_script.to_bytes())
-            
-            return True
-        else:
-            # Non-multisig P2WSH
-            return self._finalize_script(psbt_input, witness_script, is_witness=True)
-
-    def _finalize_p2tr(self, psbt_input: PSBTInput) -> bool:
-        """Finalize P2TR (Taproot) key-path input using tap_key_sig."""
-        if psbt_input.tap_key_sig is None:
-            raise ValueError("Cannot finalize P2TR input: tap_key_sig is not set")
-
-        psbt_input.final_scriptsig = Script([])
-        psbt_input.final_scriptwitness = [psbt_input.tap_key_sig]
-
-        # Clear intermediate Taproot fields per BIP-174/371
-        psbt_input.tap_key_sig = None
-        psbt_input.tap_script_sigs = {}
-        psbt_input.tap_leaf_scripts = {}
-        psbt_input.tap_bip32_derivation = {}
-        psbt_input.tap_internal_key = None
-        psbt_input.tap_merkle_root = None
-        psbt_input.partial_sigs = {}
-        psbt_input.sighash_type = None
-        psbt_input.redeem_script = None
-        psbt_input.witness_script = None
-        psbt_input.bip32_derivs = {}
-
-        return True
-
-    def _finalize_script(self, psbt_input: PSBTInput, script: Script, is_witness: bool) -> bool:
-        """
-        Finalize a script by constructing the appropriate scriptSig or witness.
-        """
-        script_ops = script.script if hasattr(script, "script") else []
-
-        # Enhanced multisig detection and handling
-        if (len(script_ops) >= 4 and
-            script_ops[0] == 'OP_2' and  # Check for OP_2 string
-            script_ops[-1] == 'OP_CHECKMULTISIG'):  # Check for OP_CHECKMULTISIG string
-            
-            # Extract m and n values
-            m = 2  # From OP_2
-            n = 3  # From OP_3
-            
-            # Extract public keys from script (they're between m and n)
-            pubkeys_in_script = []
-            for i in range(1, 4):  # indices 1, 2, 3 for the three pubkeys
-                if i < len(script_ops):
-                    pk = script_ops[i]
-                    if isinstance(pk, str):
-                        pubkeys_in_script.append(bytes.fromhex(pk))
-                    elif isinstance(pk, bytes):
-                        pubkeys_in_script.append(pk)
-            
-            if len(pubkeys_in_script) != n:
-                return False
-            
-            # Collect signatures in the order of pubkeys in the script
-            ordered_sigs = []
-            
-            for script_pubkey in pubkeys_in_script:
-                # Check each pubkey from partial_sigs to see if it matches
-                for partial_pubkey, sig in psbt_input.partial_sigs.items():
-                    # Normalize to bytes for comparison
-                    if isinstance(partial_pubkey, str):
-                        partial_pubkey_bytes = bytes.fromhex(partial_pubkey)
-                    else:
-                        partial_pubkey_bytes = partial_pubkey
-                    
-                    # Compare the actual pubkey bytes (not including any extra data)
-                    script_pubkey_hex = script_pubkey.hex() if isinstance(script_pubkey, bytes) else script_pubkey
-                    partial_pubkey_hex = partial_pubkey_bytes.hex()
-                    
-                    # Only compare the first 33 bytes (compressed pubkey length)
-                    if script_pubkey_hex[:66] == partial_pubkey_hex[:66]:
-                        ordered_sigs.append((script_pubkey, sig))
-                        break
-            
-            # Check if we have enough signatures
-            if len(ordered_sigs) < m:
-                print(f"Not enough signatures: have {len(ordered_sigs)}, need {m}")
-                return False
-            
-            # Use only the first m signatures
-            signatures_to_use = [sig for _, sig in ordered_sigs[:m]]
-            
-            # Build the final script
-            if is_witness:
-                psbt_input.final_scriptsig = Script([])
-                # Witness stack for multisig: [OP_0, sig1, sig2, ..., sigM, witnessScript]
-                witness_elements = [b'']  # OP_0 (empty bytes for multisig bug)
-                for sig in signatures_to_use:
-                    # Ensure signature is bytes
-                    if isinstance(sig, str):
-                        witness_elements.append(bytes.fromhex(sig))
-                    else:
-                        witness_elements.append(sig)
-                witness_elements.append(self._safe_to_bytes(script))
-                psbt_input.final_scriptwitness = witness_elements
-            else:
-                # For P2SH multisig (non-witness)
-                script_elements = []
-                script_elements.append(b'')  # OP_0 (empty bytes)
-                for sig in signatures_to_use:
-                    if isinstance(sig, str):
-                        script_elements.append(bytes.fromhex(sig))
-                    else:
-                        script_elements.append(sig)
-                script_elements.append(self._safe_to_bytes(script))
-                psbt_input.final_scriptsig = Script(script_elements)
-
-            return True
-
-        # Handle other script types...
-        return False
-
-    def _parse_global_section(self, stream: BytesIO) -> None:
-        """Parse the global section of a PSBT."""
-        while True:
-            # Read key-value pair
-            key_data = self._read_key_value_pair(stream)
-            if key_data is None:
-                break
-            
-            key_type, key_data, value_data = key_data
-            
-            if key_type == self.GlobalTypes.UNSIGNED_TX:
-                self.tx = Transaction.from_bytes(value_data)
-                # Initialize input/output arrays
-                self.inputs = [PSBTInput() for _ in self.tx.inputs]
-                self.outputs = [PSBTOutput() for _ in self.tx.outputs]
-            elif key_type == self.GlobalTypes.XPUB:
-                fingerprint_path = struct.unpack('<I', key_data[:4])[0], list(struct.unpack('<' + 'I' * ((len(key_data) - 4) // 4), key_data[4:]))
-                self.xpubs[value_data] = fingerprint_path
-            elif key_type == self.GlobalTypes.VERSION:
-                self.version = struct.unpack('<I', value_data)[0]
-            elif key_type == self.GlobalTypes.PROPRIETARY:
-                self.proprietary[key_data] = value_data
-            else:
-                self.unknown[key_data] = value_data
-
-    def _parse_input_section(self, stream: BytesIO, input_index: int) -> None:
-        """Parse an input section of a PSBT."""
-        psbt_input = self.inputs[input_index]
-        
-        while True:
-            key_data = self._read_key_value_pair(stream)
-            if key_data is None:
-                break
-            
-            key_type, key_data, value_data = key_data
-            
-            if key_type == self.InputTypes.NON_WITNESS_UTXO:
-                psbt_input.non_witness_utxo = Transaction.from_bytes(value_data)
-            elif key_type == self.InputTypes.WITNESS_UTXO:
-                # Parse witness UTXO manually to ensure correctness
-                import struct
-                from bitcoinutils.utils import read_varint
-                
-                # Read amount (8 bytes, little-endian)
-                amount = struct.unpack('<Q', value_data[:8])[0]
-                
-                # Read script length and script
-                script_len, varint_size = read_varint(value_data[8:])
-                script_start = 8 + varint_size
-                script_data = value_data[script_start:script_start + script_len]
-                
-                # Create TxOutput with parsed data
-                script_pubkey = Script.from_raw(script_data)
-                psbt_input.witness_utxo = TxOutput(amount, script_pubkey)
-            elif key_type == self.InputTypes.PARTIAL_SIG:
-                # Ensure we only store the compressed pubkey (33 bytes)
-                # Some implementations might include extra data
-                if len(key_data) > 33:
-                    key_data = key_data[:33]
-                psbt_input.partial_sigs[key_data] = value_data
-            elif key_type == self.InputTypes.SIGHASH_TYPE:
-                psbt_input.sighash_type = struct.unpack('<I', value_data)[0]
-            elif key_type == self.InputTypes.REDEEM_SCRIPT:
-                psbt_input.redeem_script = Script.from_bytes(value_data)
-            elif key_type == self.InputTypes.WITNESS_SCRIPT:
-                psbt_input.witness_script = Script.from_bytes(value_data)
-            elif key_type == self.InputTypes.BIP32_DERIVATION:
-                fingerprint = struct.unpack('<I', value_data[:4])[0]
-                path = list(struct.unpack('<' + 'I' * ((len(value_data) - 4) // 4), value_data[4:]))
-                psbt_input.bip32_derivs[key_data] = (fingerprint, path)
-            elif key_type == self.InputTypes.FINAL_SCRIPTSIG:
-                psbt_input.final_scriptsig = Script.from_bytes(value_data)
-            elif key_type == self.InputTypes.FINAL_SCRIPTWITNESS:
-                # Parse witness stack
-                witness_stack = []
-                offset = 0
-                while offset < len(value_data):
-                    item_len, varint_len = read_varint(value_data[offset:])
-                    offset += varint_len
-                    witness_stack.append(value_data[offset:offset + item_len])
-                    offset += item_len
-                psbt_input.final_scriptwitness = witness_stack
-            elif key_type == self.InputTypes.RIPEMD160:
-                psbt_input.ripemd160_preimages[key_data] = value_data
-            elif key_type == self.InputTypes.SHA256:
-                psbt_input.sha256_preimages[key_data] = value_data
-            elif key_type == self.InputTypes.HASH160:
-                psbt_input.hash160_preimages[key_data] = value_data
-            elif key_type == self.InputTypes.HASH256:
-                psbt_input.hash256_preimages[key_data] = value_data
-            # BIP-371 Taproot input fields
-            elif key_type == self.InputTypes.TAP_KEY_SIG:
-                if len(value_data) not in (64, 65):
-                    raise ValueError(
-                        f"Invalid tap_key_sig length {len(value_data)}: "
-                        "expected 64 or 65 bytes"
-                    )
-                psbt_input.tap_key_sig = value_data
-            elif key_type == self.InputTypes.TAP_SCRIPT_SIG:
-                # key_data includes type byte prefix already stripped;
-                # remaining = x-only pubkey(32) + leaf_hash(32)
-                if len(key_data) != 64:
-                    raise ValueError(
-                        f"Invalid tap_script_sig key length {len(key_data)}: "
-                        "expected 64 bytes (32 + 32)"
-                    )
-                if len(value_data) not in (64, 65):
-                    raise ValueError(
-                        f"Invalid tap_script_sig length {len(value_data)}: "
-                        "expected 64 or 65 bytes"
-                    )
-                xonly_pubkey = key_data[:32]
-                leaf_hash = key_data[32:64]
-                psbt_input.tap_script_sigs[(xonly_pubkey, leaf_hash)] = value_data
-            elif key_type == self.InputTypes.TAP_LEAF_SCRIPT:
-                control_block = key_data
-                cb_len = len(control_block)
-                if cb_len < 33 or (cb_len - 33) % 32 != 0:
-                    raise ValueError(
-                        f"Invalid tap_leaf_script control block length {cb_len}"
-                    )
-                if len(value_data) < 1:
-                    raise ValueError("Empty tap_leaf_script value")
-                leaf_ver = value_data[-1]
-                script_bytes = value_data[:-1]
-                psbt_input.tap_leaf_scripts[control_block] = (script_bytes, leaf_ver)
-            elif key_type == self.InputTypes.TAP_BIP32_DERIVATION:
-                if len(key_data) != 32:
-                    raise ValueError(
-                        f"Invalid tap_bip32_derivation key length {len(key_data)}: "
-                        "expected 32 bytes"
-                    )
-                xonly = key_data
-                vstream = BytesIO(value_data)
-                num_hashes_b = vstream.read(1)
-                num_hashes = num_hashes_b[0] if num_hashes_b else 0
-                leaf_hashes = []
-                for _ in range(num_hashes):
-                    leaf_hashes.append(vstream.read(32))
-                fingerprint = vstream.read(4)
-                remaining = vstream.read()
-                path = list(struct.unpack('<' + 'I' * (len(remaining) // 4), remaining))
-                psbt_input.tap_bip32_derivation[xonly] = (leaf_hashes, fingerprint, path)
-            elif key_type == self.InputTypes.TAP_INTERNAL_KEY:
-                if len(value_data) != 32:
-                    raise ValueError(
-                        f"Invalid tap_internal_key length {len(value_data)}: "
-                        "expected 32 bytes"
-                    )
-                psbt_input.tap_internal_key = value_data
-            elif key_type == self.InputTypes.TAP_MERKLE_ROOT:
-                if len(value_data) != 32:
-                    raise ValueError(
-                        f"Invalid tap_merkle_root length {len(value_data)}: "
-                        "expected 32 bytes"
-                    )
-                psbt_input.tap_merkle_root = value_data
-            elif key_type == self.InputTypes.PROPRIETARY:
-                psbt_input.proprietary[key_data] = value_data
-            else:
-                psbt_input.unknown[key_data] = value_data
-
-    def _parse_output_section(self, stream: BytesIO, output_index: int) -> None:
-        """Parse an output section of a PSBT."""
-        psbt_output = self.outputs[output_index]
-        
-        while True:
-            key_data = self._read_key_value_pair(stream)
-            if key_data is None:
-                break
-            
-            key_type, key_data, value_data = key_data
-            
-            if key_type == self.OutputTypes.REDEEM_SCRIPT:
-                psbt_output.redeem_script = Script.from_bytes(value_data)
-            elif key_type == self.OutputTypes.WITNESS_SCRIPT:
-                psbt_output.witness_script = Script.from_bytes(value_data)
-            elif key_type == self.OutputTypes.BIP32_DERIVATION:
-                fingerprint = struct.unpack('<I', value_data[:4])[0]
-                path = list(struct.unpack('<' + 'I' * ((len(value_data) - 4) // 4), value_data[4:]))
-                psbt_output.bip32_derivs[key_data] = (fingerprint, path)
-            # BIP-371 Taproot output fields
-            elif key_type == self.OutputTypes.TAP_INTERNAL_KEY:
-                if len(value_data) != 32:
-                    raise ValueError(
-                        f"Invalid output tap_internal_key length {len(value_data)}: "
-                        "expected 32 bytes"
-                    )
-                psbt_output.tap_internal_key = value_data
-            elif key_type == self.OutputTypes.TAP_TREE:
-                psbt_output.tap_tree = value_data
-            elif key_type == self.OutputTypes.TAP_BIP32_DERIVATION:
-                if len(key_data) != 32:
-                    raise ValueError(
-                        f"Invalid output tap_bip32_derivation key length {len(key_data)}: "
-                        "expected 32 bytes"
-                    )
-                xonly = key_data
-                vstream = BytesIO(value_data)
-                num_hashes_b = vstream.read(1)
-                num_hashes = num_hashes_b[0] if num_hashes_b else 0
-                leaf_hashes = []
-                for _ in range(num_hashes):
-                    leaf_hashes.append(vstream.read(32))
-                fingerprint = vstream.read(4)
-                remaining = vstream.read()
-                path = list(struct.unpack('<' + 'I' * (len(remaining) // 4), remaining))
-                psbt_output.tap_bip32_derivation[xonly] = (leaf_hashes, fingerprint, path)
-            elif key_type == self.OutputTypes.PROPRIETARY:
-                psbt_output.proprietary[key_data] = value_data
-            else:
-                psbt_output.unknown[key_data] = value_data
-
-    def _serialize_global_section(self, result: BytesIO) -> None:
-        """Serialize the global section of a PSBT."""
-        
-        # Unsigned transaction (required)
-        if self.tx:
-            tx_data = self._safe_serialize_transaction(self.tx)
-            self._write_key_value_pair(result, self.GlobalTypes.UNSIGNED_TX, b'', tx_data)
-        
-        # Extended public keys
-        for xpub, (fingerprint, path) in self.xpubs.items():
-            value_data = struct.pack('<I', fingerprint) + struct.pack('<' + 'I' * len(path), *path)
-            self._write_key_value_pair(result, self.GlobalTypes.XPUB, xpub, value_data)
-        
-        # Version (if not default)
-        if self.version != self.VERSION:
-            self._write_key_value_pair(result, self.GlobalTypes.VERSION, b'', 
-                                    struct.pack('<I', self.version))
-        
-        # Proprietary fields
-        for key_data, value_data in self.proprietary.items():
-            self._write_key_value_pair(result, self.GlobalTypes.PROPRIETARY, key_data, value_data)
-        
-        # Unknown fields
-        for key_data, value_data in self.unknown.items():
-            result.write(bytes([len(key_data)]))
-            result.write(key_data)
-            result.write(bytes([len(value_data)]))
-            result.write(value_data)
-        
-        # Section separator
-        result.write(b'\x00')
-
-    def _read_key_value_pair(self, stream: BytesIO) -> Optional[Tuple[int, bytes, bytes]]:
-        """
-        Read a key-value pair from the stream.
-        
-        Returns:
-            Tuple of (key_type, key_data, value_data) or None if separator found
-        """
-        # Read key length
-        key_len_bytes = stream.read(1)
-        if not key_len_bytes or key_len_bytes == b'\x00':
-            return None
-        
-        key_len = key_len_bytes[0]
-        if key_len == 0:
-            return None
-        
-        # Read key
-        key = stream.read(key_len)
-        if len(key) != key_len:
-            raise ValueError("Unexpected end of stream reading key")
-        
-        # Read value length
-        value_len_bytes = stream.read(1)
-        if not value_len_bytes:
-            raise ValueError("Unexpected end of stream reading value length")
-        
-        value_len = value_len_bytes[0]
-        
-        # Read value
-        value = stream.read(value_len)
-        if len(value) != value_len:
-            raise ValueError("Unexpected end of stream reading value")
-        
-        # Parse key
-        key_type = key[0]
-        key_data = key[1:] if len(key) > 1 else b''
-        
-        return key_type, key_data, value
-
-    def _serialize_input_section(self, result: BytesIO, input_index: int) -> None:
-        """Serialize an input section."""
-        psbt_input = self.inputs[input_index]
-
-        # Ensure scripts are Script objects, not bytes
-        if isinstance(psbt_input.redeem_script, bytes):
-            psbt_input.redeem_script = Script(psbt_input.redeem_script)
-        if isinstance(psbt_input.witness_script, bytes):
-            psbt_input.witness_script = Script(psbt_input.witness_script)
-        if isinstance(psbt_input.final_scriptsig, bytes):
-            psbt_input.final_scriptsig = Script(psbt_input.final_scriptsig)
-        
-        # Non-witness UTXO
-        if psbt_input.non_witness_utxo:
-            utxo_data = self._safe_serialize_transaction(psbt_input.non_witness_utxo)
-            self._write_key_value_pair(result, self.InputTypes.NON_WITNESS_UTXO, b'', utxo_data)
-        
-        # Witness UTXO - Safe handling
-        if psbt_input.witness_utxo:
-            try:
-                # For TxOutput objects, we need to serialize properly
-                import struct
-                from bitcoinutils.utils import encode_varint
-                
-                witness_utxo = psbt_input.witness_utxo
-                
-                # Ensure we have a proper TxOutput object
-                if not hasattr(witness_utxo, 'amount') or not hasattr(witness_utxo, 'script_pubkey'):
-                    raise ValueError("Invalid witness UTXO structure")
-                
-                # Serialize amount (8 bytes, little-endian)
-                amount_bytes = struct.pack("<Q", int(witness_utxo.amount))
-                
-                # Serialize script_pubkey
-                script_bytes = witness_utxo.script_pubkey.to_bytes()
-                script_len_bytes = encode_varint(len(script_bytes))
-                
-                # Combine: amount + script_length + script
-                witness_data = amount_bytes + script_len_bytes + script_bytes
-                
-            except Exception as e:
-                print(f"Error serializing witness UTXO: {e}")
-                raise
-            
-            self._write_key_value_pair(result, self.InputTypes.WITNESS_UTXO, b'', witness_data)
-        
-        # Partial signatures
-        for pubkey, signature in psbt_input.partial_sigs.items():
-            # Ensure both pubkey and signature are bytes
-            pubkey_bytes = pubkey if isinstance(pubkey, bytes) else self._safe_to_bytes(pubkey)
-            sig_bytes = signature if isinstance(signature, bytes) else self._safe_to_bytes(signature)
-            self._write_key_value_pair(result, self.InputTypes.PARTIAL_SIG, pubkey_bytes, sig_bytes)
-        
-        # Sighash type
-        if psbt_input.sighash_type is not None:
-            self._write_key_value_pair(result, self.InputTypes.SIGHASH_TYPE, b'', 
-                                    struct.pack('<I', psbt_input.sighash_type))
-        
-        # Redeem script
-        if psbt_input.redeem_script:
-            script_bytes = self._safe_to_bytes(psbt_input.redeem_script)
-            self._write_key_value_pair(result, self.InputTypes.REDEEM_SCRIPT, b'', script_bytes)
-        
-        # Witness script
-        if psbt_input.witness_script:
-            script_bytes = self._safe_to_bytes(psbt_input.witness_script)
-            self._write_key_value_pair(result, self.InputTypes.WITNESS_SCRIPT, b'', script_bytes)
-        
-        # BIP32 derivations
-        for pubkey, (fingerprint, path) in psbt_input.bip32_derivs.items():
-            value_data = struct.pack('<I', fingerprint) + struct.pack('<' + 'I' * len(path), *path)
-            pubkey_bytes = pubkey if isinstance(pubkey, bytes) else self._safe_to_bytes(pubkey)
-            self._write_key_value_pair(result, self.InputTypes.BIP32_DERIVATION, pubkey_bytes, value_data)
-        
-        # Final scriptSig
-        if psbt_input.final_scriptsig:
-            script_bytes = self._safe_to_bytes(psbt_input.final_scriptsig)
-            self._write_key_value_pair(result, self.InputTypes.FINAL_SCRIPTSIG, b'', script_bytes)
-        
-        # Final script witness
-        if psbt_input.final_scriptwitness:
-            witness_data = b''
-            for item in psbt_input.final_scriptwitness:
-                if isinstance(item, str):
-                    # Handle hex strings - empty string means OP_0
-                    item_bytes = bytes.fromhex(item) if item else b''
-                elif isinstance(item, bytes):
-                    item_bytes = item
-                else:
-                    item_bytes = self._safe_to_bytes(item)
-                witness_data += encode_varint(len(item_bytes)) + item_bytes
-            self._write_key_value_pair(result, self.InputTypes.FINAL_SCRIPTWITNESS, b'', witness_data)
-        
-        # Hash preimages (these should already be bytes)
-        for hash_val, preimage in psbt_input.ripemd160_preimages.items():
-            self._write_key_value_pair(result, self.InputTypes.RIPEMD160, hash_val, preimage)
-        
-        for hash_val, preimage in psbt_input.sha256_preimages.items():
-            self._write_key_value_pair(result, self.InputTypes.SHA256, hash_val, preimage)
-        
-        for hash_val, preimage in psbt_input.hash160_preimages.items():
-            self._write_key_value_pair(result, self.InputTypes.HASH160, hash_val, preimage)
-        
-        for hash_val, preimage in psbt_input.hash256_preimages.items():
-            self._write_key_value_pair(result, self.InputTypes.HASH256, hash_val, preimage)
-        
-        # BIP-371 Taproot input fields
-        if psbt_input.tap_key_sig is not None:
-            self._write_key_value_pair(result, self.InputTypes.TAP_KEY_SIG, b'', psbt_input.tap_key_sig)
-        
-        for (xonly_pubkey, leaf_hash), sig in psbt_input.tap_script_sigs.items():
-            key_data = xonly_pubkey + leaf_hash
-            self._write_key_value_pair(result, self.InputTypes.TAP_SCRIPT_SIG, key_data, sig)
-        
-        for control_block, (script_bytes, leaf_ver) in psbt_input.tap_leaf_scripts.items():
-            value_data = script_bytes + bytes([leaf_ver])
-            self._write_key_value_pair(result, self.InputTypes.TAP_LEAF_SCRIPT, control_block, value_data)
-        
-        for xonly, (leaf_hashes, fingerprint, path) in psbt_input.tap_bip32_derivation.items():
-            value_data = bytes([len(leaf_hashes)])
-            for lh in leaf_hashes:
-                value_data += lh
-            value_data += fingerprint
-            value_data += struct.pack('<' + 'I' * len(path), *path)
-            self._write_key_value_pair(result, self.InputTypes.TAP_BIP32_DERIVATION, xonly, value_data)
-        
-        if psbt_input.tap_internal_key is not None:
-            self._write_key_value_pair(result, self.InputTypes.TAP_INTERNAL_KEY, b'', psbt_input.tap_internal_key)
-        
-        if psbt_input.tap_merkle_root is not None:
-            self._write_key_value_pair(result, self.InputTypes.TAP_MERKLE_ROOT, b'', psbt_input.tap_merkle_root)
-        
-        # Proprietary and unknown
-        for key_data, value_data in psbt_input.proprietary.items():
-            self._write_key_value_pair(result, self.InputTypes.PROPRIETARY, key_data, value_data)
-        
-        for key_data, value_data in psbt_input.unknown.items():
-            result.write(bytes([len(key_data) + 1]))
-            result.write(key_data)
-            result.write(bytes([len(value_data)]))
-            result.write(value_data)
-        
-        # Section separator
-        result.write(b'\x00')
-
-    def _serialize_output_section(self, result: BytesIO, output_index: int) -> None:
-        """Serialize an output section."""
-        psbt_output = self.outputs[output_index]
-
-        # Ensure scripts are Script objects, not bytes
-        if isinstance(psbt_output.redeem_script, bytes):
-            psbt_output.redeem_script = Script(psbt_output.redeem_script)
-        if isinstance(psbt_output.witness_script, bytes):
-            psbt_output.witness_script = Script(psbt_output.witness_script)
-        
-        # Redeem script
-        if psbt_output.redeem_script:
-            script_bytes = self._safe_to_bytes(psbt_output.redeem_script)
-            self._write_key_value_pair(result, self.OutputTypes.REDEEM_SCRIPT, b'', script_bytes)
-        
-        # Witness script
-        if psbt_output.witness_script:
-            script_bytes = self._safe_to_bytes(psbt_output.witness_script)
-            self._write_key_value_pair(result, self.OutputTypes.WITNESS_SCRIPT, b'', script_bytes)
-        
-        # BIP32 derivations
-        for pubkey, (fingerprint, path) in psbt_output.bip32_derivs.items():
-            value_data = struct.pack('<I', fingerprint) + struct.pack('<' + 'I' * len(path), *path)
-            pubkey_bytes = pubkey if isinstance(pubkey, bytes) else self._safe_to_bytes(pubkey)
-            self._write_key_value_pair(result, self.OutputTypes.BIP32_DERIVATION, pubkey_bytes, value_data)
-        
-        # BIP-371 Taproot output fields
-        if psbt_output.tap_internal_key is not None:
-            self._write_key_value_pair(result, self.OutputTypes.TAP_INTERNAL_KEY, b'', psbt_output.tap_internal_key)
-        
-        if psbt_output.tap_tree is not None:
-            self._write_key_value_pair(result, self.OutputTypes.TAP_TREE, b'', psbt_output.tap_tree)
-        
-        for xonly, (leaf_hashes, fingerprint, path) in psbt_output.tap_bip32_derivation.items():
-            value_data = bytes([len(leaf_hashes)])
-            for lh in leaf_hashes:
-                value_data += lh
-            value_data += fingerprint
-            value_data += struct.pack('<' + 'I' * len(path), *path)
-            self._write_key_value_pair(result, self.OutputTypes.TAP_BIP32_DERIVATION, xonly, value_data)
-        
-        # Proprietary and unknown
-        for key_data, value_data in psbt_output.proprietary.items():
-            self._write_key_value_pair(result, self.OutputTypes.PROPRIETARY, key_data, value_data)
-        
-        for key_data, value_data in psbt_output.unknown.items():
-            result.write(bytes([len(key_data) + 1]))
-            result.write(key_data)
-            result.write(bytes([len(value_data)]))
-            result.write(value_data)
-        
-        # Section separator
-        result.write(b'\x00')
-
-    def _write_key_value_pair(self, result: BytesIO, key_type: int, key_data: bytes, value_data: bytes) -> None:
-        """Write a key-value pair to the stream."""
-        key = bytes([key_type]) + key_data
-        result.write(encode_varint(len(key)))
-        result.write(key)
-        result.write(encode_varint(len(value_data)))
-        result.write(value_data)
+    Returns m signatures ordered by their pubkey position in the script.
+    """
+    ordered = []
+    for pk_hex in script_pubkeys:
+        pk_bytes = h_to_b(pk_hex)
+        if pk_bytes in partial_sigs:
+            ordered.append(partial_sigs[pk_bytes])
+    if len(ordered) < m:
+        raise ValueError(
+            f"Not enough signatures for multisig: have {len(ordered)}, need {m}"
+        )
+    return ordered[:m]
